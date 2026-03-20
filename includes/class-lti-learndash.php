@@ -165,7 +165,7 @@ class LTI_LearnDash_Service {
 				return new WP_Error( 'lti_create_pro_question_error', sprintf( 'Error al crear la pregunta interna de LearnDash para el bloque %d.', (int) $item['block_index'] ) );
 			}
 
-			$this->link_question_post_to_pro_question( (int) $question_post_id, (int) $quiz_post_id, (int) $pro_question_id );
+			$this->link_question_post_to_pro_question( (int) $question_post_id, (int) $quiz_post_id, (int) $pro_question_id, $is_new_quiz );
 			$created_question_ids[] = (int) $question_post_id;
 			$created[]              = array(
 				'post_id'         => (int) $question_post_id,
@@ -183,6 +183,16 @@ class LTI_LearnDash_Service {
 					(int) $pro_quiz_id
 				)
 			);
+		}
+
+		if ( ! $is_new_quiz ) {
+			$new_question_ids = array_map(
+				static function ( $entry ) {
+					return isset( $entry['post_id'] ) ? (int) $entry['post_id'] : 0;
+				},
+				$created
+			);
+			$this->rebuild_existing_quiz_builder( (int) $quiz_post_id, $new_question_ids );
 		}
 
 		if ( $is_new_quiz ) {
@@ -340,7 +350,7 @@ class LTI_LearnDash_Service {
 	 * @param int $pro_question_id
 	 * @return void
 	 */
-	private function link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id ) {
+	private function link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id, $update_builder = true ) {
 		update_post_meta( $question_post_id, 'question_pro_id', (int) $pro_question_id );
 
 		if ( function_exists( 'learndash_update_setting' ) ) {
@@ -358,7 +368,9 @@ class LTI_LearnDash_Service {
 			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $pro_question_id );
 		}
 
-		$this->update_quiz_builder_questions( (int) $quiz_post_id, (int) $question_post_id );
+		if ( $update_builder ) {
+			$this->update_quiz_builder_questions( (int) $quiz_post_id, (int) $question_post_id );
+		}
 	}
 
 	/**
@@ -484,6 +496,130 @@ class LTI_LearnDash_Service {
 			if ( ! is_numeric( $key ) ) {
 				return false;
 			}
+		}
+
+		return true;
+	}
+
+
+	/**
+	 * Reconstruye completamente el builder de un quiz existente: limpia inválidas,
+	 * mantiene válidas y agrega las nuevas preguntas importadas con reindexación total.
+	 *
+	 * @param int   $quiz_post_id
+	 * @param int[] $new_question_ids
+	 * @return void
+	 */
+	private function rebuild_existing_quiz_builder( $quiz_post_id, $new_question_ids ) {
+		if ( ! function_exists( 'learndash_get_quiz_questions' ) || ! function_exists( 'learndash_set_quiz_questions' ) ) {
+			return;
+		}
+
+		$builder_original = learndash_get_quiz_questions( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Rebuild existing builder (original). quiz_post_id=%d | data=%s', (int) $quiz_post_id, wp_json_encode( $builder_original ) ) );
+
+		$existing_ids = $this->extract_question_post_ids_from_builder( $builder_original );
+		$valid_ids    = array();
+		foreach ( $existing_ids as $question_id ) {
+			if ( $this->is_valid_question_post( (int) $question_id ) ) {
+				$valid_ids[] = (int) $question_id;
+			}
+		}
+
+		$new_valid_ids = array();
+		foreach ( $new_question_ids as $question_id ) {
+			if ( $this->is_valid_question_post( (int) $question_id ) ) {
+				$new_valid_ids[] = (int) $question_id;
+			}
+		}
+
+		$final_ids = array_values( array_unique( array_merge( $valid_ids, $new_valid_ids ) ) );
+		$final_builder = array();
+		foreach ( $final_ids as $index => $question_id ) {
+			$final_builder[ (int) $question_id ] = $index + 1;
+		}
+
+		learndash_set_quiz_questions( (int) $quiz_post_id, $final_builder );
+
+		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
+			learndash_update_quiz_questions( (int) $quiz_post_id );
+		}
+
+		clean_post_cache( (int) $quiz_post_id );
+		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
+
+		do_action( 'learndash_quiz_questions_updated', (int) $quiz_post_id, $final_builder );
+
+		$builder_final = learndash_get_quiz_questions( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Rebuild existing builder (final). quiz_post_id=%d | data=%s', (int) $quiz_post_id, wp_json_encode( $builder_final ) ) );
+	}
+
+	/**
+	 * Extrae IDs de preguntas del builder sin asumir una sola forma.
+	 *
+	 * @param mixed $builder_data
+	 * @return int[]
+	 */
+	private function extract_question_post_ids_from_builder( $builder_data ) {
+		$ids = array();
+
+		if ( ! is_array( $builder_data ) ) {
+			return $ids;
+		}
+
+		if ( isset( $builder_data['questions'] ) && is_array( $builder_data['questions'] ) ) {
+			return $this->extract_question_post_ids_from_builder( $builder_data['questions'] );
+		}
+
+		// Caso común LearnDash: [question_post_id => order].
+		if ( $this->is_assoc_array( $builder_data ) && $this->all_keys_numeric( $builder_data ) ) {
+			$ids = array_map( 'intval', array_keys( $builder_data ) );
+			return array_values( array_unique( array_filter( $ids ) ) );
+		}
+
+		// Lista simple de IDs [12, 18, 34].
+		$first = reset( $builder_data );
+		if ( ! $this->is_assoc_array( $builder_data ) && is_numeric( $first ) ) {
+			$ids = array_map( 'intval', $builder_data );
+			return array_values( array_unique( array_filter( $ids ) ) );
+		}
+
+		// Lista de arrays con ids embebidos.
+		foreach ( $builder_data as $value ) {
+			if ( ! is_array( $value ) ) {
+				continue;
+			}
+
+			if ( isset( $value['question_id'] ) && is_numeric( $value['question_id'] ) ) {
+				$ids[] = (int) $value['question_id'];
+			}
+			if ( isset( $value['post_id'] ) && is_numeric( $value['post_id'] ) ) {
+				$ids[] = (int) $value['post_id'];
+			}
+			if ( isset( $value['id'] ) && is_numeric( $value['id'] ) ) {
+				$ids[] = (int) $value['id'];
+			}
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'intval', $ids ) ) ) );
+	}
+
+	/**
+	 * @param int $question_id
+	 * @return bool
+	 */
+	private function is_valid_question_post( $question_id ) {
+		if ( $question_id <= 0 ) {
+			return false;
+		}
+
+		$post = get_post( (int) $question_id );
+		if ( ! $post || 'sfwd-question' !== $post->post_type ) {
+			return false;
+		}
+
+		if ( in_array( $post->post_status, array( 'trash', 'auto-draft' ), true ) ) {
+			return false;
 		}
 
 		return true;
