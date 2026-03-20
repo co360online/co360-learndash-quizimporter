@@ -1,0 +1,230 @@
+<?php
+/**
+ * Servicio de integración con LearnDash.
+ */
+class LTI_LearnDash_Service {
+	/**
+	 * Comprueba disponibilidad básica de LearnDash.
+	 *
+	 * @return bool
+	 */
+	public function is_available() {
+		return post_type_exists( 'sfwd-quiz' ) && class_exists( 'WpProQuiz_Model_Quiz' );
+	}
+
+	/**
+	 * Crea un quiz con sus preguntas.
+	 *
+	 * @param string                             $quiz_title Título del quiz.
+	 * @param string                             $quiz_description Descripción opcional.
+	 * @param array<int,array<string,mixed>>     $items Preguntas validadas.
+	 * @return LTI_Import_Result
+	 */
+	public function create_quiz_with_questions( $quiz_title, $quiz_description, $items ) {
+		$result = new LTI_Import_Result();
+
+		if ( ! $this->is_available() ) {
+			$result->add_error( 'LearnDash no está disponible o no expone las clases requeridas de quiz.' );
+			return $result;
+		}
+
+		$quiz_post_id = $this->create_quiz_post( $quiz_title, $quiz_description );
+		if ( is_wp_error( $quiz_post_id ) || ! $quiz_post_id ) {
+			$result->add_error( 'No se pudo crear el post del quiz.' );
+			return $result;
+		}
+
+		$pro_quiz_id = $this->create_pro_quiz( $quiz_title, $quiz_description );
+		if ( is_wp_error( $pro_quiz_id ) || ! $pro_quiz_id ) {
+			wp_delete_post( $quiz_post_id, true );
+			$result->add_error( 'No se pudo crear el quiz interno de LearnDash.' );
+			return $result;
+		}
+
+		$this->link_quiz_post_to_pro_quiz( $quiz_post_id, $pro_quiz_id );
+
+		$created_questions = array();
+
+		foreach ( $items as $item ) {
+			$question_post_id = $this->create_question_post( $item, $quiz_post_id );
+			if ( is_wp_error( $question_post_id ) || ! $question_post_id ) {
+				$this->rollback_created_data( $quiz_post_id, $created_questions );
+				$result->add_error( sprintf( 'Error al crear la pregunta del bloque %d.', (int) $item['block_index'] ) );
+				return $result;
+			}
+
+			$pro_question_id = $this->create_pro_question( $item, $pro_quiz_id );
+			if ( is_wp_error( $pro_question_id ) || ! $pro_question_id ) {
+				$this->rollback_created_data( $quiz_post_id, $created_questions, $question_post_id );
+				$result->add_error( sprintf( 'Error al crear la pregunta interna de LearnDash para el bloque %d.', (int) $item['block_index'] ) );
+				return $result;
+			}
+
+			$this->link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id );
+			$created_questions[] = (int) $question_post_id;
+		}
+
+		$result->set_success( true );
+		$result->set_data( 'quiz_post_id', $quiz_post_id );
+		$result->set_data( 'quiz_edit_link', get_edit_post_link( $quiz_post_id, '' ) );
+		$result->set_data( 'questions_created', count( $created_questions ) );
+		$result->add_message( sprintf( 'Quiz creado con éxito. Preguntas creadas: %d.', count( $created_questions ) ) );
+
+		return $result;
+	}
+
+	/**
+	 * @param string $title
+	 * @param string $description
+	 * @return int|WP_Error
+	 */
+	private function create_quiz_post( $title, $description ) {
+		$quiz_postarr = array(
+			'post_type'    => 'sfwd-quiz',
+			'post_status'  => 'publish',
+			'post_title'   => $title,
+			'post_content' => $description,
+		);
+
+		return wp_insert_post( $quiz_postarr, true );
+	}
+
+	/**
+	 * @param string $title
+	 * @param string $description
+	 * @return int|WP_Error
+	 */
+	private function create_pro_quiz( $title, $description ) {
+		try {
+			$quiz_model = new WpProQuiz_Model_Quiz();
+			$quiz_model->setName( $title );
+			$quiz_model->setText( $description );
+			$quiz_model->setResultText( '' );
+			$quiz_model->setTitleHidden( false );
+
+			$mapper = new WpProQuiz_Model_QuizMapper();
+			return (int) $mapper->save( $quiz_model );
+		} catch ( Exception $e ) {
+			return new WP_Error( 'lti_pro_quiz_error', $e->getMessage() );
+		}
+	}
+
+	/**
+	 * @param int $quiz_post_id
+	 * @param int $pro_quiz_id
+	 * @return void
+	 */
+	private function link_quiz_post_to_pro_quiz( $quiz_post_id, $pro_quiz_id ) {
+		update_post_meta( $quiz_post_id, 'quiz_pro_id', (int) $pro_quiz_id );
+
+		if ( function_exists( 'learndash_update_setting' ) ) {
+			learndash_update_setting( $quiz_post_id, 'quiz_pro', (int) $pro_quiz_id );
+		}
+	}
+
+	/**
+	 * @param array<string,mixed> $item
+	 * @param int                 $quiz_post_id
+	 * @return int|WP_Error
+	 */
+	private function create_question_post( $item, $quiz_post_id ) {
+		$postarr = array(
+			'post_type'    => 'sfwd-question',
+			'post_status'  => 'publish',
+			'post_title'   => sanitize_text_field( (string) $item['title'] ),
+			'post_content' => wp_kses_post( (string) $item['question'] ),
+		);
+
+		$question_post_id = wp_insert_post( $postarr, true );
+		if ( is_wp_error( $question_post_id ) ) {
+			return $question_post_id;
+		}
+
+		update_post_meta( $question_post_id, 'lti_general_feedback', sanitize_textarea_field( (string) $item['comment'] ) );
+
+		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
+			$existing = array();
+			$existing[ (int) $question_post_id ] = 1;
+			learndash_set_quiz_questions( (int) $quiz_post_id, $existing );
+		}
+
+		return (int) $question_post_id;
+	}
+
+	/**
+	 * @param array<string,mixed> $item
+	 * @param int                 $pro_quiz_id
+	 * @return int|WP_Error
+	 */
+	private function create_pro_question( $item, $pro_quiz_id ) {
+		try {
+			$answers = array();
+
+			foreach ( $item['answers'] as $answer ) {
+				$answer_model = new WpProQuiz_Model_AnswerTypes();
+				$answer_model->setAnswer( wp_kses_post( (string) $answer['text'] ) );
+				$answer_model->setCorrect( ! empty( $answer['is_correct'] ) );
+				$answer_model->setPoints( ! empty( $answer['is_correct'] ) ? 1 : 0 );
+				$answer_model->setSortString( '' );
+				$answers[] = $answer_model;
+			}
+
+			$question_model = new WpProQuiz_Model_Question();
+			$question_model->setQuizId( (int) $pro_quiz_id );
+			$question_model->setTitle( sanitize_text_field( (string) $item['title'] ) );
+			$question_model->setQuestion( wp_kses_post( (string) $item['question'] ) );
+			$question_model->setAnswerData( $answers );
+			$question_model->setAnswerType( 'single' );
+			$question_model->setCorrectSameText( true );
+			$question_model->setTipMsg( sanitize_textarea_field( (string) $item['comment'] ) );
+
+			$mapper = new WpProQuiz_Model_QuestionMapper();
+			return (int) $mapper->save( $question_model );
+		} catch ( Exception $e ) {
+			return new WP_Error( 'lti_pro_question_error', $e->getMessage() );
+		}
+	}
+
+	/**
+	 * @param int $question_post_id
+	 * @param int $quiz_post_id
+	 * @param int $pro_question_id
+	 * @return void
+	 */
+	private function link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id ) {
+		update_post_meta( $question_post_id, 'question_pro_id', (int) $pro_question_id );
+
+		if ( function_exists( 'learndash_update_setting' ) ) {
+			learndash_update_setting( $question_post_id, 'quiz', (int) $quiz_post_id );
+			learndash_update_setting( $question_post_id, 'question_pro_id', (int) $pro_question_id );
+		}
+
+		if ( function_exists( 'learndash_get_quiz_questions' ) && function_exists( 'learndash_set_quiz_questions' ) ) {
+			$questions = learndash_get_quiz_questions( (int) $quiz_post_id );
+			if ( ! is_array( $questions ) ) {
+				$questions = array();
+			}
+			$order = count( $questions ) + 1;
+			$questions[ (int) $question_post_id ] = $order;
+			learndash_set_quiz_questions( (int) $quiz_post_id, $questions );
+		}
+	}
+
+	/**
+	 * @param int   $quiz_post_id
+	 * @param int[] $question_post_ids
+	 * @param int   $extra_question_post_id
+	 * @return void
+	 */
+	private function rollback_created_data( $quiz_post_id, $question_post_ids, $extra_question_post_id = 0 ) {
+		foreach ( $question_post_ids as $question_post_id ) {
+			wp_delete_post( (int) $question_post_id, true );
+		}
+
+		if ( $extra_question_post_id ) {
+			wp_delete_post( (int) $extra_question_post_id, true );
+		}
+
+		wp_delete_post( (int) $quiz_post_id, true );
+	}
+}

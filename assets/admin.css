@@ -1,0 +1,8 @@
+.lti-wrap textarea.code {
+	font-family: Consolas, Monaco, monospace;
+}
+
+.lti-wrap .notice ul {
+	list-style: disc;
+	margin-left: 1.5em;
+}
