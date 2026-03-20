@@ -200,7 +200,12 @@ class LTI_LearnDash_Service {
 			$question_model->setAnswerData( $answers );
 			$question_model->setAnswerType( 'single' );
 			$question_model->setCorrectSameText( true );
-			$question_model->setTipMsg( sanitize_textarea_field( (string) $item['comment'] ) );
+
+			// Feedback general del bloque "Comentario:" para acierto y fallo.
+			$feedback_message = sanitize_textarea_field( (string) $item['comment'] );
+			$question_model->setCorrectMsg( $feedback_message );
+			$question_model->setIncorrectMsg( $feedback_message );
+			$question_model->setTipMsg( $feedback_message );
 
 			$mapper      = new WpProQuiz_Model_QuestionMapper();
 			$save_result = $mapper->save( $question_model );
