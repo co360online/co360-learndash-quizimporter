@@ -15,9 +15,9 @@ class LTI_LearnDash_Service {
 	/**
 	 * Crea un quiz con sus preguntas.
 	 *
-	 * @param string                             $quiz_title Título del quiz.
-	 * @param string                             $quiz_description Descripción opcional.
-	 * @param array<int,array<string,mixed>>     $items Preguntas validadas.
+	 * @param string                         $quiz_title Título del quiz.
+	 * @param string                         $quiz_description Descripción opcional.
+	 * @param array<int,array<string,mixed>> $items Preguntas validadas.
 	 * @return LTI_Import_Result
 	 */
 	public function create_quiz_with_questions( $quiz_title, $quiz_description, $items ) {
@@ -36,37 +36,54 @@ class LTI_LearnDash_Service {
 
 		$pro_quiz_id = $this->create_pro_quiz( $quiz_title, $quiz_description );
 		if ( is_wp_error( $pro_quiz_id ) || ! $pro_quiz_id ) {
-			wp_delete_post( $quiz_post_id, true );
+			wp_delete_post( (int) $quiz_post_id, true );
 			$result->add_error( 'No se pudo crear el quiz interno de LearnDash.' );
 			return $result;
 		}
 
-		$this->link_quiz_post_to_pro_quiz( $quiz_post_id, $pro_quiz_id );
+		$this->link_quiz_post_to_pro_quiz( (int) $quiz_post_id, (int) $pro_quiz_id );
+		$this->debug_log(
+			sprintf(
+				'Quiz creado. quiz_post_id=%d | quiz_pro_id=%d',
+				(int) $quiz_post_id,
+				(int) $pro_quiz_id
+			)
+		);
 
 		$created_questions = array();
 
 		foreach ( $items as $item ) {
-			$question_post_id = $this->create_question_post( $item, $quiz_post_id );
+			$question_post_id = $this->create_question_post( $item );
 			if ( is_wp_error( $question_post_id ) || ! $question_post_id ) {
-				$this->rollback_created_data( $quiz_post_id, $created_questions );
+				$this->rollback_created_data( (int) $quiz_post_id, $created_questions );
 				$result->add_error( sprintf( 'Error al crear la pregunta del bloque %d.', (int) $item['block_index'] ) );
 				return $result;
 			}
 
-			$pro_question_id = $this->create_pro_question( $item, $pro_quiz_id );
+			$pro_question_id = $this->create_pro_question( $item, (int) $pro_quiz_id );
 			if ( is_wp_error( $pro_question_id ) || ! $pro_question_id ) {
-				$this->rollback_created_data( $quiz_post_id, $created_questions, $question_post_id );
+				$this->rollback_created_data( (int) $quiz_post_id, $created_questions, (int) $question_post_id );
 				$result->add_error( sprintf( 'Error al crear la pregunta interna de LearnDash para el bloque %d.', (int) $item['block_index'] ) );
 				return $result;
 			}
 
-			$this->link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id );
+			$this->link_question_post_to_pro_question( (int) $question_post_id, (int) $quiz_post_id, (int) $pro_question_id );
 			$created_questions[] = (int) $question_post_id;
+
+			$this->debug_log(
+				sprintf(
+					'Pregunta vinculada. question_post_id=%d | question_pro_id=%d | quiz_post_id=%d | quiz_pro_id=%d',
+					(int) $question_post_id,
+					(int) $pro_question_id,
+					(int) $quiz_post_id,
+					(int) $pro_quiz_id
+				)
+			);
 		}
 
 		$result->set_success( true );
-		$result->set_data( 'quiz_post_id', $quiz_post_id );
-		$result->set_data( 'quiz_edit_link', get_edit_post_link( $quiz_post_id, '' ) );
+		$result->set_data( 'quiz_post_id', (int) $quiz_post_id );
+		$result->set_data( 'quiz_edit_link', get_edit_post_link( (int) $quiz_post_id, '' ) );
 		$result->set_data( 'questions_created', count( $created_questions ) );
 		$result->add_message( sprintf( 'Quiz creado con éxito. Preguntas creadas: %d.', count( $created_questions ) ) );
 
@@ -97,13 +114,21 @@ class LTI_LearnDash_Service {
 	private function create_pro_quiz( $title, $description ) {
 		try {
 			$quiz_model = new WpProQuiz_Model_Quiz();
+			$quiz_model->setId( 0 );
 			$quiz_model->setName( $title );
 			$quiz_model->setText( $description );
 			$quiz_model->setResultText( '' );
 			$quiz_model->setTitleHidden( false );
 
-			$mapper = new WpProQuiz_Model_QuizMapper();
-			return (int) $mapper->save( $quiz_model );
+			$mapper      = new WpProQuiz_Model_QuizMapper();
+			$save_result = $mapper->save( $quiz_model );
+			$quiz_id     = $this->extract_model_id( $quiz_model, $save_result );
+
+			if ( $quiz_id <= 0 ) {
+				return new WP_Error( 'lti_pro_quiz_id_invalid', 'No se pudo determinar el ID interno del quiz creado.' );
+			}
+
+			return $quiz_id;
 		} catch ( Exception $e ) {
 			return new WP_Error( 'lti_pro_quiz_error', $e->getMessage() );
 		}
@@ -123,11 +148,12 @@ class LTI_LearnDash_Service {
 	}
 
 	/**
+	 * Crea exclusivamente el post de la pregunta (sin vínculo aún).
+	 *
 	 * @param array<string,mixed> $item
-	 * @param int                 $quiz_post_id
 	 * @return int|WP_Error
 	 */
-	private function create_question_post( $item, $quiz_post_id ) {
+	private function create_question_post( $item ) {
 		$postarr = array(
 			'post_type'    => 'sfwd-question',
 			'post_status'  => 'publish',
@@ -140,13 +166,9 @@ class LTI_LearnDash_Service {
 			return $question_post_id;
 		}
 
-		update_post_meta( $question_post_id, 'lti_general_feedback', sanitize_textarea_field( (string) $item['comment'] ) );
+		update_post_meta( (int) $question_post_id, 'lti_general_feedback', sanitize_textarea_field( (string) $item['comment'] ) );
 
-		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
-			$existing = array();
-			$existing[ (int) $question_post_id ] = 1;
-			learndash_set_quiz_questions( (int) $quiz_post_id, $existing );
-		}
+		$this->debug_log( sprintf( 'Post de pregunta creado. question_post_id=%d', (int) $question_post_id ) );
 
 		return (int) $question_post_id;
 	}
@@ -170,7 +192,9 @@ class LTI_LearnDash_Service {
 			}
 
 			$question_model = new WpProQuiz_Model_Question();
+			$question_model->setId( 0 );
 			$question_model->setQuizId( (int) $pro_quiz_id );
+			$question_model->setCategoryId( 0 );
 			$question_model->setTitle( sanitize_text_field( (string) $item['title'] ) );
 			$question_model->setQuestion( wp_kses_post( (string) $item['question'] ) );
 			$question_model->setAnswerData( $answers );
@@ -178,14 +202,31 @@ class LTI_LearnDash_Service {
 			$question_model->setCorrectSameText( true );
 			$question_model->setTipMsg( sanitize_textarea_field( (string) $item['comment'] ) );
 
-			$mapper = new WpProQuiz_Model_QuestionMapper();
-			return (int) $mapper->save( $question_model );
+			$mapper      = new WpProQuiz_Model_QuestionMapper();
+			$save_result = $mapper->save( $question_model );
+			$question_id = $this->extract_model_id( $question_model, $save_result );
+
+			if ( $question_id <= 0 ) {
+				return new WP_Error( 'lti_pro_question_id_invalid', 'No se pudo determinar el ID interno de la pregunta creada.' );
+			}
+
+			$this->debug_log(
+				sprintf(
+					'Pregunta interna creada. question_pro_id=%d | quiz_pro_id=%d',
+					(int) $question_id,
+					(int) $pro_quiz_id
+				)
+			);
+
+			return (int) $question_id;
 		} catch ( Exception $e ) {
 			return new WP_Error( 'lti_pro_question_error', $e->getMessage() );
 		}
 	}
 
 	/**
+	 * Vincula post de pregunta de WP con su pregunta interna de WpProQuiz y con el quiz.
+	 *
 	 * @param int $question_post_id
 	 * @param int $quiz_post_id
 	 * @param int $pro_question_id
@@ -199,15 +240,49 @@ class LTI_LearnDash_Service {
 			learndash_update_setting( $question_post_id, 'question_pro_id', (int) $pro_question_id );
 		}
 
+		if ( function_exists( 'learndash_proquiz_sync_question_fields' ) ) {
+			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $pro_question_id );
+		}
+
 		if ( function_exists( 'learndash_get_quiz_questions' ) && function_exists( 'learndash_set_quiz_questions' ) ) {
 			$questions = learndash_get_quiz_questions( (int) $quiz_post_id );
 			if ( ! is_array( $questions ) ) {
 				$questions = array();
 			}
+
 			$order = count( $questions ) + 1;
 			$questions[ (int) $question_post_id ] = $order;
 			learndash_set_quiz_questions( (int) $quiz_post_id, $questions );
 		}
+	}
+
+	/**
+	 * Extrae el ID real tras guardar un modelo de WpProQuiz.
+	 *
+	 * IMPORTANTE:
+	 * Algunos métodos save() pueden devolver booleano/estado y no el ID.
+	 * Por ello se prioriza getId() del modelo y solo como fallback un retorno numérico.
+	 *
+	 * @param object     $model Modelo WpProQuiz.
+	 * @param mixed|null $save_result Retorno de save().
+	 * @return int
+	 */
+	private function extract_model_id( $model, $save_result ) {
+		if ( is_object( $model ) && method_exists( $model, 'getId' ) ) {
+			$model_id = (int) $model->getId();
+			if ( $model_id > 0 ) {
+				return $model_id;
+			}
+		}
+
+		if ( is_numeric( $save_result ) ) {
+			$save_id = (int) $save_result;
+			if ( $save_id > 0 ) {
+				return $save_id;
+			}
+		}
+
+		return 0;
 	}
 
 	/**
@@ -226,5 +301,17 @@ class LTI_LearnDash_Service {
 		}
 
 		wp_delete_post( (int) $quiz_post_id, true );
+	}
+
+	/**
+	 * Logging temporal de trazabilidad para depuración de IDs y vinculaciones.
+	 *
+	 * @param string $message
+	 * @return void
+	 */
+	private function debug_log( $message ) {
+		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+			error_log( '[LTI LearnDash] ' . (string) $message );
+		}
 	}
 }
