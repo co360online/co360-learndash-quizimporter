@@ -358,29 +358,137 @@ class LTI_LearnDash_Service {
 			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $pro_question_id );
 		}
 
-		if ( function_exists( 'learndash_get_quiz_questions' ) && function_exists( 'learndash_set_quiz_questions' ) ) {
-			$questions = learndash_get_quiz_questions( (int) $quiz_post_id );
-			if ( ! is_array( $questions ) ) {
-				$questions = array();
-			}
-
-			if ( ! isset( $questions[ (int) $question_post_id ] ) ) {
-				$order = count( $questions ) + 1;
-				$questions[ (int) $question_post_id ] = $order;
-			}
-
-			learndash_set_quiz_questions( (int) $quiz_post_id, $questions );
-			$this->debug_log( sprintf( 'Builder actualizado. quiz_post_id=%d | total_questions=%d | added_question_post_id=%d', (int) $quiz_post_id, count( $questions ), (int) $question_post_id ) );
-		}
+		$this->update_quiz_builder_questions( (int) $quiz_post_id, (int) $question_post_id );
 	}
 
 	/**
-	 * Extrae el ID real tras guardar un modelo de WpProQuiz.
+	 * Actualiza el builder de preguntas del quiz preservando la estructura real usada por LearnDash.
 	 *
-	 * @param object     $model
-	 * @param mixed|null $save_result
-	 * @return int
+	 * @param int $quiz_post_id
+	 * @param int $question_post_id
+	 * @return void
 	 */
+	private function update_quiz_builder_questions( $quiz_post_id, $question_post_id ) {
+		if ( ! function_exists( 'learndash_get_quiz_questions' ) || ! function_exists( 'learndash_set_quiz_questions' ) ) {
+			return;
+		}
+
+		$questions_before = learndash_get_quiz_questions( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Builder antes update. quiz_post_id=%d | data=%s', (int) $quiz_post_id, wp_json_encode( $questions_before ) ) );
+
+		$questions_after = $this->append_question_preserving_structure( $questions_before, (int) $question_post_id );
+		learndash_set_quiz_questions( (int) $quiz_post_id, $questions_after );
+
+		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
+			learndash_update_quiz_questions( (int) $quiz_post_id );
+		}
+
+		/**
+		 * Hook de compatibilidad para permitir a LearnDash/terceros rehacer estructuras si lo necesitan.
+		 */
+		do_action( 'learndash_quiz_questions_updated', (int) $quiz_post_id, $questions_after );
+
+		$questions_final = learndash_get_quiz_questions( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Builder despues update. quiz_post_id=%d | added_question_post_id=%d | data=%s', (int) $quiz_post_id, (int) $question_post_id, wp_json_encode( $questions_final ) ) );
+	}
+
+	/**
+	 * Inserta una pregunta nueva preservando la forma exacta del array original.
+	 *
+	 * @param mixed $questions_data
+	 * @param int   $question_post_id
+	 * @return array<mixed>
+	 */
+	private function append_question_preserving_structure( $questions_data, $question_post_id ) {
+		if ( ! is_array( $questions_data ) || empty( $questions_data ) ) {
+			return array( (int) $question_post_id => 1 );
+		}
+
+		$questions = $questions_data;
+
+		if ( isset( $questions['questions'] ) && is_array( $questions['questions'] ) ) {
+			$questions['questions'] = $this->append_question_preserving_structure( $questions['questions'], (int) $question_post_id );
+			return $questions;
+		}
+
+		$first = reset( $questions );
+
+		// Estructura tipo [question_id => order].
+		if ( $this->is_assoc_array( $questions ) && $this->all_keys_numeric( $questions ) ) {
+			if ( ! isset( $questions[ (int) $question_post_id ] ) ) {
+				$next_order = empty( $questions ) ? 1 : ( max( array_map( 'intval', array_values( $questions ) ) ) + 1 );
+				$questions[ (int) $question_post_id ] = $next_order;
+			}
+			return $questions;
+		}
+
+		// Estructura lista de IDs: [12, 18, 34].
+		if ( ! $this->is_assoc_array( $questions ) && is_numeric( $first ) ) {
+			if ( ! in_array( (int) $question_post_id, array_map( 'intval', $questions ), true ) ) {
+				$questions[] = (int) $question_post_id;
+			}
+			return $questions;
+		}
+
+		// Estructura lista de arrays con identificador interno (id/question_id/post_id).
+		if ( ! $this->is_assoc_array( $questions ) && is_array( $first ) ) {
+			$exists = false;
+			foreach ( $questions as $entry ) {
+				if ( ! is_array( $entry ) ) {
+					continue;
+				}
+				$entry_id = isset( $entry['question_id'] ) ? (int) $entry['question_id'] : ( isset( $entry['post_id'] ) ? (int) $entry['post_id'] : ( isset( $entry['id'] ) ? (int) $entry['id'] : 0 ) );
+				if ( $entry_id === (int) $question_post_id ) {
+					$exists = true;
+					break;
+				}
+			}
+
+			if ( ! $exists ) {
+				$order = count( $questions ) + 1;
+				$questions[] = array(
+					'id'          => (int) $question_post_id,
+					'question_id' => (int) $question_post_id,
+					'post_id'     => (int) $question_post_id,
+					'sort'        => $order,
+					'order'       => $order,
+				);
+			}
+
+			return $questions;
+		}
+
+		// Fallback defensivo.
+		$questions[ (int) $question_post_id ] = count( $questions ) + 1;
+		return $questions;
+	}
+
+	/**
+	 * @param array<mixed> $array
+	 * @return bool
+	 */
+	private function is_assoc_array( $array ) {
+		if ( array() === $array ) {
+			return false;
+		}
+
+		return array_keys( $array ) !== range( 0, count( $array ) - 1 );
+	}
+
+	/**
+	 * @param array<mixed> $array
+	 * @return bool
+	 */
+	private function all_keys_numeric( $array ) {
+		foreach ( array_keys( $array ) as $key ) {
+			if ( ! is_numeric( $key ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	private function extract_model_id( $model, $save_result ) {
 		if ( is_object( $model ) && method_exists( $model, 'getId' ) ) {
 			$model_id = (int) $model->getId();
