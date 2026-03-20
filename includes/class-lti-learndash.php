@@ -119,6 +119,7 @@ class LTI_LearnDash_Service {
 		}
 
 		$pro_quiz_id = $this->get_pro_quiz_id_for_post( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Modo quiz existente. quiz_post_id=%d | quiz_pro_id_resuelto=%d', (int) $quiz_post_id, (int) $pro_quiz_id ) );
 		if ( $pro_quiz_id <= 0 ) {
 			$result->add_error( 'No se pudo localizar el ID interno de LearnDash para el quiz seleccionado.' );
 			return $result;
@@ -345,7 +346,13 @@ class LTI_LearnDash_Service {
 		if ( function_exists( 'learndash_update_setting' ) ) {
 			learndash_update_setting( $question_post_id, 'quiz', (int) $quiz_post_id );
 			learndash_update_setting( $question_post_id, 'question_pro_id', (int) $pro_question_id );
+			$quiz_pro_id = $this->get_pro_quiz_id_for_post( (int) $quiz_post_id );
+			if ( $quiz_pro_id > 0 ) {
+				learndash_update_setting( $question_post_id, 'quiz_pro_id', (int) $quiz_pro_id );
+			}
 		}
+
+		update_post_meta( $question_post_id, 'quiz_id', (int) $quiz_post_id );
 
 		if ( function_exists( 'learndash_proquiz_sync_question_fields' ) ) {
 			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $pro_question_id );
@@ -357,9 +364,13 @@ class LTI_LearnDash_Service {
 				$questions = array();
 			}
 
-			$order = count( $questions ) + 1;
-			$questions[ (int) $question_post_id ] = $order;
+			if ( ! isset( $questions[ (int) $question_post_id ] ) ) {
+				$order = count( $questions ) + 1;
+				$questions[ (int) $question_post_id ] = $order;
+			}
+
 			learndash_set_quiz_questions( (int) $quiz_post_id, $questions );
+			$this->debug_log( sprintf( 'Builder actualizado. quiz_post_id=%d | total_questions=%d | added_question_post_id=%d', (int) $quiz_post_id, count( $questions ), (int) $question_post_id ) );
 		}
 	}
 
@@ -393,21 +404,48 @@ class LTI_LearnDash_Service {
 	 * @return int
 	 */
 	private function get_pro_quiz_id_for_post( $quiz_post_id ) {
-		$pro_id = 0;
+		$resolved_ids = array();
 
 		if ( function_exists( 'learndash_get_setting' ) ) {
-			$pro_id = (int) learndash_get_setting( $quiz_post_id, 'quiz_pro' );
+			$setting = learndash_get_setting( $quiz_post_id, 'quiz_pro' );
+			if ( is_numeric( $setting ) && (int) $setting > 0 ) {
+				$resolved_ids[] = (int) $setting;
+			}
 		}
 
-		if ( $pro_id <= 0 ) {
-			$pro_id = (int) get_post_meta( $quiz_post_id, 'quiz_pro_id', true );
+		if ( function_exists( 'learndash_get_quiz_pro' ) ) {
+			$quiz_pro = learndash_get_quiz_pro( $quiz_post_id );
+			if ( is_object( $quiz_pro ) && method_exists( $quiz_pro, 'getId' ) ) {
+				$quiz_pro_id = (int) $quiz_pro->getId();
+				if ( $quiz_pro_id > 0 ) {
+					$resolved_ids[] = $quiz_pro_id;
+				}
+			}
 		}
 
-		if ( $pro_id <= 0 ) {
-			$pro_id = (int) get_post_meta( $quiz_post_id, 'quiz_pro', true );
+		$meta_pro_id = get_post_meta( $quiz_post_id, 'quiz_pro_id', true );
+		if ( is_numeric( $meta_pro_id ) && (int) $meta_pro_id > 0 ) {
+			$resolved_ids[] = (int) $meta_pro_id;
 		}
 
-		return $pro_id;
+		$sfwd_quiz_meta = get_post_meta( $quiz_post_id, '_sfwd-quiz', true );
+		if ( is_array( $sfwd_quiz_meta ) ) {
+			$keys = array( 'sfwd-quiz_quiz_pro', 'quiz_pro', 'quiz_pro_id' );
+			foreach ( $keys as $key ) {
+				if ( isset( $sfwd_quiz_meta[ $key ] ) && is_numeric( $sfwd_quiz_meta[ $key ] ) && (int) $sfwd_quiz_meta[ $key ] > 0 ) {
+					$resolved_ids[] = (int) $sfwd_quiz_meta[ $key ];
+				}
+			}
+		}
+
+		$resolved_ids = array_values( array_unique( array_filter( $resolved_ids ) ) );
+		if ( empty( $resolved_ids ) ) {
+			return 0;
+		}
+
+		$resolved = (int) $resolved_ids[0];
+		$this->debug_log( sprintf( 'Resolución quiz_pro_id. quiz_post_id=%d | candidatos=%s | usado=%d', (int) $quiz_post_id, wp_json_encode( $resolved_ids ), $resolved ) );
+		return $resolved;
 	}
 
 	/**
