@@ -10,20 +10,20 @@ class LTI_Parser {
 	 * @return array<int,array<string,mixed>>
 	 */
 	public function parse( $raw_text ) {
-		$normalized = str_replace( array( "\r\n", "\r" ), "\n", (string) $raw_text );
+		$normalized = $this->normalize_input( (string) $raw_text );
 		$normalized = trim( $normalized );
 
 		if ( '' === $normalized ) {
 			return array();
 		}
 
-		$chunks = preg_split( '/\n\s*\n/', $normalized );
+		$chunks = preg_split( '/\n\s*\n+/u', $normalized );
 		$items  = array();
 
 		foreach ( $chunks as $index => $chunk ) {
 			$lines = array_values(
 				array_filter(
-					array_map( 'trim', explode( "\n", (string) $chunk ) ),
+					array_map( array( $this, 'normalize_line' ), explode( "\n", (string) $chunk ) ),
 					static function ( $line ) {
 						return '' !== $line;
 					}
@@ -51,13 +51,13 @@ class LTI_Parser {
 					continue;
 				}
 
-				if ( 0 === stripos( $line, 'Comentario:' ) ) {
-					$item['comment'] = trim( substr( $line, strlen( 'Comentario:' ) ) );
+				if ( preg_match( '/^Comentario\s*:/iu', $line ) ) {
+					$item['comment'] = trim( preg_replace( '/^Comentario\s*:/iu', '', $line ) );
 					continue;
 				}
 
-				$is_correct = 0 === strpos( $line, '*' );
-				$text       = $is_correct ? ltrim( substr( $line, 1 ) ) : $line;
+				$is_correct = 0 === strpos( ltrim( $line ), '*' );
+				$text       = $is_correct ? ltrim( ltrim( $line ), '* ' ) : $line;
 
 				$item['answers'][] = array(
 					'text'       => $text,
@@ -69,5 +69,29 @@ class LTI_Parser {
 		}
 
 		return $items;
+	}
+
+	/**
+	 * Normaliza texto pegado desde distintas fuentes (Word, saltos inconsistentes, espacios especiales).
+	 *
+	 * @param string $text
+	 * @return string
+	 */
+	private function normalize_input( $text ) {
+		$text = str_replace( array( "\r\n", "\r" ), "\n", $text );
+		$text = str_replace( array( "\xC2\xA0", "\xE2\x80\xAF" ), ' ', $text );
+		$text = preg_replace( "/\n{3,}/", "\n\n", $text );
+
+		return (string) $text;
+	}
+
+	/**
+	 * @param string $line
+	 * @return string
+	 */
+	private function normalize_line( $line ) {
+		$line = trim( (string) $line );
+		$line = preg_replace( '/[ \t]+/u', ' ', $line );
+		return (string) $line;
 	}
 }

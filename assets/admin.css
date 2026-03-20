@@ -6,3 +6,21 @@
 	list-style: disc;
 	margin-left: 1.5em;
 }
+
+.lti-preview-summary,
+.lti-preview-question {
+	background: #fff;
+	border: 1px solid #dcdcde;
+	padding: 12px;
+	margin-bottom: 12px;
+}
+
+.lti-preview-question ul {
+	list-style: disc;
+	margin-left: 20px;
+}
+
+.lti-answer-correct {
+	font-weight: 600;
+	color: #135e21;
+}

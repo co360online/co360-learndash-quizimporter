@@ -88,4 +88,11 @@ class LTI_Import_Result {
 	public function get_data( $key, $default = null ) {
 		return isset( $this->data[ $key ] ) ? $this->data[ $key ] : $default;
 	}
+
+	/**
+	 * @return array<string,mixed>
+	 */
+	public function get_all_data() {
+		return $this->data;
+	}
 }
