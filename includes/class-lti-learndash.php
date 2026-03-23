@@ -274,11 +274,15 @@ class LTI_LearnDash_Service {
 		foreach ( $final_ids as $question_id ) {
 			$this->sync_question_quiz_relations( (int) $question_id, (int) $quiz_post_id, (int) $quiz_pro_id );
 		}
+		$this->log_proquiz_question_rows( $new_valid_pros, 'after_sync_question_quiz_relations', (int) $quiz_pro_id );
 
 		$proquiz_resync = $this->resync_proquiz_questions_layer( (int) $quiz_post_id, (int) $quiz_pro_id, $final_ids, $new_valid_pros );
 		if ( is_wp_error( $proquiz_resync ) ) {
+			$this->log_proquiz_question_rows( $new_valid_pros, 'before_return_proquiz_resync_error', (int) $quiz_pro_id );
 			return $proquiz_resync;
 		}
+
+		$this->log_proquiz_question_rows( $new_valid_pros, 'after_resync_proquiz_questions_layer', (int) $quiz_pro_id );
 
 		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
 			learndash_update_quiz_questions( (int) $quiz_post_id );
@@ -472,6 +476,9 @@ class LTI_LearnDash_Service {
 			if ( method_exists( $mapper, 'fetch' ) && method_exists( $mapper, 'save' ) ) {
 				$model = $mapper->fetch( (int) $pro_id );
 				if ( $model && is_object( $model ) ) {
+					$before_id = method_exists( $model, 'getId' ) ? (int) $model->getId() : 0;
+					$before_qz = method_exists( $model, 'getQuizId' ) ? (int) $model->getQuizId() : 0;
+					$this->debug_log( sprintf( 'ProQuiz fetch model before save. pro_id=%d | model_id=%d | model_quiz_id=%d', (int) $pro_id, $before_id, $before_qz ) );
 					if ( method_exists( $model, 'setQuizId' ) ) {
 						$model->setQuizId( (int) $quiz_pro_id );
 					}
@@ -479,6 +486,11 @@ class LTI_LearnDash_Service {
 						$model->setSort( (int) $position );
 					}
 					$mapper->save( $model );
+					$after_id = method_exists( $model, 'getId' ) ? (int) $model->getId() : 0;
+					$after_qz = method_exists( $model, 'getQuizId' ) ? (int) $model->getQuizId() : 0;
+					$this->debug_log( sprintf( 'ProQuiz model after save. pro_id=%d | model_id=%d | model_quiz_id=%d', (int) $pro_id, $after_id, $after_qz ) );
+				} else {
+					$this->debug_log( sprintf( 'ProQuiz fetch model returned empty. pro_id=%d', (int) $pro_id ) );
 				}
 			}
 			$position++;
@@ -504,6 +516,7 @@ class LTI_LearnDash_Service {
 		$new_missing = array_values( array_diff( array_values( array_unique( $new_valid_pro_ids ) ), $after_ids ) );
 		if ( ! empty( $new_missing ) ) {
 			$this->debug_log( sprintf( 'ProQuiz missing new pro IDs. quiz_post_id=%d | quiz_pro_id=%d | missing=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $new_missing ) ) );
+			$this->log_proquiz_question_rows( $new_valid_pro_ids, 'before_return_missing_new_pro_ids', (int) $quiz_pro_id );
 			return new WP_Error( 'lti_proquiz_missing_new', sprintf( 'Las nuevas preguntas no quedaron en la capa final real de WpProQuiz. Faltan pro IDs: %s', wp_json_encode( $new_missing ) ) );
 		}
 
@@ -761,6 +774,9 @@ class LTI_LearnDash_Service {
 				return new WP_Error( 'lti_pro_question_id_invalid', 'No se pudo determinar el ID interno de la pregunta creada.' );
 			}
 
+			$this->debug_log( sprintf( 'create_pro_question creado. question_pro_id=%d | quiz_pro_id=%d', (int) $question_id, (int) $pro_quiz_id ) );
+			$this->log_proquiz_question_rows( array( (int) $question_id ), 'after_create_pro_question', (int) $pro_quiz_id );
+
 			return (int) $question_id;
 		} catch ( Exception $e ) {
 			return new WP_Error( 'lti_pro_question_error', $e->getMessage() );
@@ -797,6 +813,7 @@ class LTI_LearnDash_Service {
 	private function get_pro_quiz_id_for_post( $quiz_post_id ) {
 		$resolved_ids = array();
 
+		$setting = null;
 		if ( function_exists( 'learndash_get_setting' ) ) {
 			$setting = learndash_get_setting( $quiz_post_id, 'quiz_pro' );
 			if ( is_numeric( $setting ) && (int) $setting > 0 ) {
@@ -804,12 +821,13 @@ class LTI_LearnDash_Service {
 			}
 		}
 
+		$quiz_pro_obj_id = null;
 		if ( function_exists( 'learndash_get_quiz_pro' ) ) {
 			$quiz_pro = learndash_get_quiz_pro( $quiz_post_id );
 			if ( is_object( $quiz_pro ) && method_exists( $quiz_pro, 'getId' ) ) {
-				$quiz_pro_id = (int) $quiz_pro->getId();
-				if ( $quiz_pro_id > 0 ) {
-					$resolved_ids[] = $quiz_pro_id;
+				$quiz_pro_obj_id = (int) $quiz_pro->getId();
+				if ( $quiz_pro_obj_id > 0 ) {
+					$resolved_ids[] = $quiz_pro_obj_id;
 				}
 			}
 		}
@@ -835,7 +853,7 @@ class LTI_LearnDash_Service {
 		}
 
 		$resolved = (int) $resolved_ids[0];
-		$this->debug_log( sprintf( 'Resolución quiz_pro_id. quiz_post_id=%d | candidatos=%s | usado=%d', (int) $quiz_post_id, wp_json_encode( $resolved_ids ), $resolved ) );
+		$this->debug_log( sprintf( 'Resolución quiz_pro_id candidatos. quiz_post_id=%d | learndash_get_setting(quiz_pro)=%s | learndash_get_quiz_pro()->getId()=%s | meta_quiz_pro_id=%s | _sfwd-quiz=%s | candidatos=%s | usado=%d', (int) $quiz_post_id, wp_json_encode( $setting ), wp_json_encode( $quiz_pro_obj_id ), wp_json_encode( $meta_pro_id ), wp_json_encode( $sfwd_quiz_meta ), wp_json_encode( $resolved_ids ), $resolved ) );
 		return $resolved;
 	}
 
@@ -888,6 +906,72 @@ class LTI_LearnDash_Service {
 		return true;
 	}
 
+
+
+	/**
+	 * Diagnóstico directo en BD de filas WpProQuiz para pro IDs dados.
+	 *
+	 * @param int[]  $pro_ids
+	 * @param string $context
+	 * @param int    $quiz_pro_id
+	 * @return void
+	 */
+	private function log_proquiz_question_rows( $pro_ids, $context, $quiz_pro_id = 0 ) {
+		global $wpdb;
+
+		$pro_ids = array_values( array_unique( array_map( 'intval', (array) $pro_ids ) ) );
+		if ( empty( $pro_ids ) ) {
+			$this->debug_log( sprintf( 'DB diag %s: no pro_ids provided. quiz_pro_id=%d', $context, (int) $quiz_pro_id ) );
+			return;
+		}
+
+		$candidates = array(
+			$wpdb->prefix . 'wp_pro_quiz_question',
+			$wpdb->base_prefix . 'wp_pro_quiz_question',
+			$wpdb->prefix . 'pro_quiz_question',
+			$wpdb->base_prefix . 'pro_quiz_question',
+		);
+
+		$table_name = '';
+		foreach ( array_unique( $candidates ) as $candidate ) {
+			$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $candidate ) );
+			if ( $exists === $candidate ) {
+				$table_name = $candidate;
+				break;
+			}
+		}
+
+		if ( '' === $table_name ) {
+			$this->debug_log( sprintf( 'DB diag %s: question table not found. candidates=%s', $context, wp_json_encode( $candidates ) ) );
+			return;
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $pro_ids ), '%d' ) );
+		$sql          = "SELECT * FROM {$table_name} WHERE id IN ({$placeholders}) ORDER BY id ASC";
+		$rows         = $wpdb->get_results( $wpdb->prepare( $sql, $pro_ids ), ARRAY_A );
+
+		$normalized = array();
+		foreach ( (array) $rows as $row ) {
+			$normalized[] = array(
+				'id'      => isset( $row['id'] ) ? (int) $row['id'] : null,
+				'quiz_id' => isset( $row['quiz_id'] ) ? (int) $row['quiz_id'] : null,
+				'sort'    => isset( $row['sort'] ) ? (int) $row['sort'] : null,
+				'title'   => isset( $row['title'] ) ? $row['title'] : ( isset( $row['question'] ) ? $row['question'] : null ),
+				'raw'     => $row,
+			);
+		}
+
+		$this->debug_log(
+			sprintf(
+				'DB diag %s. quiz_pro_id=%d | table=%s | pro_ids=%s | rows=%s',
+				$context,
+				(int) $quiz_pro_id,
+				$table_name,
+				wp_json_encode( $pro_ids ),
+				wp_json_encode( $normalized )
+			)
+		);
+	}
 
 	/**
 	 * Verificación final fail-closed tras resync en modo existing.
