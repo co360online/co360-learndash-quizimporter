@@ -267,10 +267,10 @@ class LTI_LearnDash_Service {
 		$this->debug_log( sprintf( 'Resync invalid discarded. quiz_post_id=%d | items=%s', (int) $quiz_post_id, wp_json_encode( $invalid_map ) ) );
 		$this->debug_log( sprintf( 'Resync new added. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_ids ) ) );
 
-		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
-			learndash_set_quiz_questions( (int) $quiz_post_id, $final_builder );
+		$builder_persist = $this->persist_quiz_builder_questions( (int) $quiz_post_id, $final_builder, $final_ids );
+		if ( is_wp_error( $builder_persist ) ) {
+			return $builder_persist;
 		}
-		$this->persist_quiz_builder_questions( (int) $quiz_post_id, $final_builder, $final_ids );
 
 		foreach ( $final_ids as $question_id ) {
 			$this->sync_question_quiz_relations( (int) $question_id, (int) $quiz_post_id, (int) $quiz_pro_id );
@@ -284,10 +284,6 @@ class LTI_LearnDash_Service {
 		}
 
 		$this->log_proquiz_question_rows( $new_valid_pros, 'after_resync_proquiz_questions_layer', (int) $quiz_pro_id );
-
-		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
-			learndash_update_quiz_questions( (int) $quiz_post_id );
-		}
 
 		clean_post_cache( (int) $quiz_post_id );
 		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
@@ -870,48 +866,42 @@ class LTI_LearnDash_Service {
 	 * @param int   $quiz_post_id
 	 * @param array $builder_map
 	 * @param int[] $builder_ids
-	 * @return void
+	 * @return true|WP_Error
 	 */
 	private function persist_quiz_builder_questions( $quiz_post_id, $builder_map, $builder_ids ) {
 		$builder_map = is_array( $builder_map ) ? $builder_map : array();
 		$builder_ids = array_values( array_unique( array_map( 'intval', (array) $builder_ids ) ) );
 
 		$quiz_questions = $this->get_quiz_questions_store( (int) $quiz_post_id );
-		if ( is_object( $quiz_questions ) ) {
-			$called = array();
-			if ( method_exists( $quiz_questions, 'set_questions' ) ) {
-				$quiz_questions->set_questions( $builder_map );
-				$called[] = 'set_questions(map)';
-			}
-			if ( method_exists( $quiz_questions, 'set_questions_ids' ) ) {
-				$quiz_questions->set_questions_ids( $builder_ids );
-				$called[] = 'set_questions_ids(ids)';
-			}
-			if ( method_exists( $quiz_questions, 'set_questions' ) ) {
-				$quiz_questions->set_questions( $builder_ids );
-				$called[] = 'set_questions(ids)';
-			}
-			if ( method_exists( $quiz_questions, 'save' ) ) {
-				$quiz_questions->save();
-				$called[] = 'save()';
-			}
-			if ( method_exists( $quiz_questions, 'update' ) ) {
-				$quiz_questions->update();
-				$called[] = 'update()';
-			}
-
-			$this->debug_log( sprintf( 'Builder persist via LDLMS object. quiz_post_id=%d | called=%s', (int) $quiz_post_id, wp_json_encode( $called ) ) );
+		if ( ! is_object( $quiz_questions ) ) {
+			return new WP_Error( 'lti_builder_store_missing', 'No se pudo obtener LDLMS_Factory_Post::quiz_questions().' );
 		}
 
-		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
-			learndash_set_quiz_questions( (int) $quiz_post_id, $builder_map );
+		$store_details = $this->inspect_quiz_questions_store( $quiz_questions );
+		$this->debug_log( sprintf( 'Builder store inspected. quiz_post_id=%d | details=%s', (int) $quiz_post_id, wp_json_encode( $store_details ) ) );
+
+		if ( ! method_exists( $quiz_questions, 'set_questions' ) ) {
+			return new WP_Error( 'lti_builder_set_questions_missing', 'El objeto LDLMS quiz_questions no expone set_questions().' );
 		}
-		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
-			learndash_update_quiz_questions( (int) $quiz_post_id );
+
+		try {
+			$quiz_questions->set_questions( $builder_map );
+		} catch ( Exception $e ) {
+			return new WP_Error( 'lti_builder_set_questions_error', $e->getMessage() );
 		}
+		$this->debug_log( sprintf( 'Builder persist via LDLMS object. quiz_post_id=%d | called=%s', (int) $quiz_post_id, wp_json_encode( array( 'set_questions(map)' ) ) ) );
 
 		clean_post_cache( (int) $quiz_post_id );
 		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
+
+		$ids_after = $this->get_builder_question_ids( (int) $quiz_post_id );
+		$missing   = array_values( array_diff( $builder_ids, $ids_after ) );
+		$this->debug_log( sprintf( 'Builder persist post-check. quiz_post_id=%d | expected_ids=%s | actual_ids=%s | missing=%s', (int) $quiz_post_id, wp_json_encode( $builder_ids ), wp_json_encode( $ids_after ), wp_json_encode( $missing ) ) );
+		if ( ! empty( $missing ) ) {
+			return new WP_Error( 'lti_builder_persist_incomplete', sprintf( 'Persistencia LDLMS incompleta. Faltan question_post_id en builder: %s', wp_json_encode( $missing ) ) );
+		}
+
+		return true;
 	}
 
 	/**
@@ -930,6 +920,67 @@ class LTI_LearnDash_Service {
 		}
 
 		return null;
+	}
+
+	/**
+	 * @param object $store
+	 * @return array<string,mixed>
+	 */
+	private function inspect_quiz_questions_store( $store ) {
+		$details = array(
+			'class'   => '',
+			'parent'  => '',
+			'file'    => '',
+			'methods' => array(),
+			'set_questions_source' => '',
+		);
+
+		if ( ! is_object( $store ) ) {
+			return $details;
+		}
+
+		try {
+			$reflection         = new ReflectionObject( $store );
+			$details['class']   = $reflection->getName();
+			$parent             = $reflection->getParentClass();
+			$details['parent']  = $parent ? $parent->getName() : '';
+			$details['file']    = (string) $reflection->getFileName();
+			$public_methods     = $reflection->getMethods( ReflectionMethod::IS_PUBLIC );
+			$relevant_method_re = '/question|quiz|set|save|load|update|get/i';
+
+			foreach ( $public_methods as $method ) {
+				$name = $method->getName();
+				if ( ! preg_match( $relevant_method_re, $name ) ) {
+					continue;
+				}
+				$params = array();
+				foreach ( $method->getParameters() as $parameter ) {
+					$param_str = '$' . $parameter->getName();
+					if ( $parameter->isOptional() ) {
+						$param_str .= '=optional';
+					}
+					$params[] = $param_str;
+				}
+				$details['methods'][] = $name . '(' . implode( ',', $params ) . ')';
+
+				if ( 'set_questions' === $name ) {
+					$start = (int) $method->getStartLine();
+					$end   = (int) $method->getEndLine();
+					$file  = (string) $method->getFileName();
+					if ( $file && file_exists( $file ) ) {
+						$lines = file( $file );
+						if ( is_array( $lines ) ) {
+							$source = implode( '', array_slice( $lines, max( 0, $start - 1 ), max( 0, $end - $start + 1 ) ) );
+							$details['set_questions_source'] = trim( preg_replace( '/\s+/', ' ', (string) $source ) );
+						}
+					}
+				}
+			}
+		} catch ( Exception $e ) {
+			$this->debug_log( 'inspect_quiz_questions_store error: ' . $e->getMessage() );
+		}
+
+		return $details;
 	}
 
 	/**
