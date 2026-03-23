@@ -215,14 +215,10 @@ class LTI_LearnDash_Service {
 	 * @return array<string,mixed>|WP_Error
 	 */
 	private function resync_quiz_questions( $quiz_post_id, $quiz_pro_id, $new_questions ) {
-		$builder_original = function_exists( 'learndash_get_quiz_questions' ) ? learndash_get_quiz_questions( (int) $quiz_post_id ) : array();
-		$this->debug_log( sprintf( 'Resync start. quiz_post_id=%d | quiz_pro_id=%d | builder_original=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $builder_original ) ) );
+		$existing_builder_ids = $this->get_canonical_existing_builder_post_ids( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Resync start. quiz_post_id=%d | quiz_pro_id=%d | existing_builder_ids_canonical=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $existing_builder_ids ) ) );
 
-		$builder_ids = $this->extract_question_post_ids_from_builder( $builder_original );
-		$query_ids   = $this->get_question_ids_linked_to_quiz( (int) $quiz_post_id );
-		$current_ids = array_values( array_unique( array_merge( $builder_ids, $query_ids ) ) );
-
-		$this->debug_log( sprintf( 'Resync detected current question IDs. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $current_ids ) ) );
+		$current_ids = $existing_builder_ids;
 
 		$valid_ids   = array();
 		$invalid_map = array();
@@ -256,9 +252,10 @@ class LTI_LearnDash_Service {
 			}
 		}
 
-		$this->debug_log( sprintf( 'Resync created question post IDs. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_ids ) ) );
+		$this->debug_log( sprintf( 'Resync created_post_ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_ids ) ) );
 		$this->debug_log( sprintf( 'Resync created pro_question_ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_pros ) ) );
 		$final_ids = array_values( array_unique( array_merge( $valid_ids, $new_valid_ids ) ) );
+		$this->debug_log( sprintf( 'Resync final_ids_to_persist. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $final_ids ) ) );
 		$final_builder = array();
 		foreach ( $final_ids as $index => $question_id ) {
 			$final_builder[ (int) $question_id ] = $index + 1;
@@ -1032,6 +1029,29 @@ class LTI_LearnDash_Service {
 		}
 
 		return array();
+	}
+
+	/**
+	 * Obtiene IDs canónicos existentes del builder para quizzes en modo existing.
+	 *
+	 * @param int $quiz_post_id
+	 * @return int[]
+	 */
+	private function get_canonical_existing_builder_post_ids( $quiz_post_id ) {
+		$ids = $this->get_builder_question_ids( (int) $quiz_post_id );
+		if ( ! empty( $ids ) ) {
+			return $ids;
+		}
+
+		if ( function_exists( 'learndash_get_quiz_questions' ) ) {
+			$fallback = $this->normalize_builder_post_ids( learndash_get_quiz_questions( (int) $quiz_post_id ) );
+			if ( ! empty( $fallback ) ) {
+				return $fallback;
+			}
+		}
+
+		$query_ids = $this->get_question_ids_linked_to_quiz( (int) $quiz_post_id );
+		return $this->normalize_builder_post_ids( array_values( array_map( 'intval', (array) $query_ids ) ) );
 	}
 
 	/**
