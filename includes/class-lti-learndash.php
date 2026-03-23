@@ -138,6 +138,13 @@ class LTI_LearnDash_Service {
 			return $result;
 		}
 		$canonical_builder_ids = ( isset( $resync_result['builder_ids'] ) && is_array( $resync_result['builder_ids'] ) ) ? $resync_result['builder_ids'] : array();
+		$final_post_ids        = ( isset( $resync_result['final_post_ids'] ) && is_array( $resync_result['final_post_ids'] ) ) ? $resync_result['final_post_ids'] : $canonical_builder_ids;
+
+		$refresh_result = $this->refresh_existing_quiz_after_question_resync( (int) $quiz_post_id, (int) $pro_quiz_id, $final_post_ids, $created_questions );
+		if ( is_wp_error( $refresh_result ) ) {
+			$result->add_error( $refresh_result->get_error_message() );
+			return $result;
+		}
 
 		$verification = $this->verify_created_questions_persisted( (int) $quiz_post_id, (int) $pro_quiz_id, $created_questions, $canonical_builder_ids );
 		if ( is_wp_error( $verification ) ) {
@@ -316,8 +323,9 @@ class LTI_LearnDash_Service {
 		$this->debug_log( sprintf( 'Resync end. quiz_post_id=%d | quiz_pro_id=%d | final_builder_saved=%s | final_builder_read=%s | builder_ids=%s | builder_pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final_builder ), wp_json_encode( $builder_after ), wp_json_encode( $builder_ids ), wp_json_encode( $builder_pros ) ) );
 
 		return array(
-			'success'     => true,
-			'builder_ids' => $builder_ids,
+			'success'       => true,
+			'builder_ids'   => $builder_ids,
+			'final_post_ids'=> $final_ids,
 		);
 	}
 
@@ -494,6 +502,122 @@ class LTI_LearnDash_Service {
 
 		$this->log_proquiz_question_rows( $new_valid_pro_ids, 'after_secondary_sql_sync', (int) $quiz_pro_id );
 		return true;
+	}
+
+	/**
+	 * Refresh final del quiz existente tras resync de preguntas.
+	 *
+	 * @param int                            $quiz_post_id
+	 * @param int                            $quiz_pro_id
+	 * @param int[]                          $final_post_ids
+	 * @param array<int,array<string,mixed>> $created_questions
+	 * @return array<string,mixed>|WP_Error
+	 */
+	private function refresh_existing_quiz_after_question_resync( $quiz_post_id, $quiz_pro_id, $final_post_ids, $created_questions = array() ) {
+		$final_post_ids = $this->normalize_builder_post_ids( (array) $final_post_ids );
+		$this->debug_log( sprintf( 'Refresh quiz start. quiz_post_id=%d | quiz_pro_id=%d | final_post_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final_post_ids ) ) );
+
+		clean_post_cache( (int) $quiz_post_id );
+		wp_cache_delete( (int) $quiz_post_id, 'posts' );
+		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
+		foreach ( $final_post_ids as $post_id ) {
+			clean_post_cache( (int) $post_id );
+			wp_cache_delete( (int) $post_id, 'posts' );
+			wp_cache_delete( (int) $post_id, 'post_meta' );
+		}
+
+		update_post_meta( (int) $quiz_post_id, 'ld_quiz_questions', $final_post_ids );
+		$this->debug_log( sprintf( 'Refresh quiz meta rewritten. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $final_post_ids ) ) );
+
+		$store = $this->get_quiz_questions_store( (int) $quiz_post_id );
+		if ( is_object( $store ) && method_exists( $store, 'set_questions' ) && method_exists( $store, 'get_questions' ) ) {
+			$store->set_questions( $final_post_ids );
+			$fresh_read = $this->normalize_builder_post_ids( $store->get_questions( 'post_ids' ) );
+			$this->debug_log( sprintf( 'Refresh quiz fresh LDLMS read. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $fresh_read ) ) );
+		} else {
+			$fresh_read = $this->get_builder_question_ids( (int) $quiz_post_id );
+			$this->debug_log( sprintf( 'Refresh quiz fresh LDLMS read. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $fresh_read ) ) );
+		}
+
+		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
+			learndash_update_quiz_questions( (int) $quiz_post_id );
+		}
+		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
+			$builder_map = array();
+			foreach ( $final_post_ids as $idx => $qid ) {
+				$builder_map[ (int) $qid ] = $idx + 1;
+			}
+			learndash_set_quiz_questions( (int) $quiz_post_id, $builder_map );
+		}
+
+		$mapper_pro_ids = array();
+		if ( class_exists( 'WpProQuiz_Model_QuestionMapper' ) ) {
+			try {
+				$mapper = new WpProQuiz_Model_QuestionMapper();
+				if ( method_exists( $mapper, 'fetchAll' ) ) {
+					$models = $mapper->fetchAll( (int) $quiz_pro_id );
+					if ( is_array( $models ) ) {
+						foreach ( $models as $model ) {
+							if ( is_object( $model ) && method_exists( $model, 'getId' ) ) {
+								$mapper_pro_ids[] = (int) $model->getId();
+							}
+						}
+					}
+				}
+			} catch ( Exception $e ) {
+				$this->debug_log( 'Refresh quiz mapper read error: ' . $e->getMessage() );
+			}
+		}
+		$mapper_pro_ids = array_values( array_unique( array_filter( $mapper_pro_ids ) ) );
+
+		$mapped_post_ids = array();
+		foreach ( $mapper_pro_ids as $pro_id ) {
+			$post_id = $this->get_question_post_id_by_pro_question_id( (int) $pro_id );
+			if ( $post_id > 0 ) {
+				$mapped_post_ids[] = (int) $post_id;
+			}
+		}
+		$mapped_post_ids = array_values( array_unique( $mapped_post_ids ) );
+		$this->debug_log( sprintf( 'Refresh quiz final mapper pro_ids. quiz_pro_id=%d | ids=%s', (int) $quiz_pro_id, wp_json_encode( $mapper_pro_ids ) ) );
+		$this->debug_log( sprintf( 'Refresh quiz final mapped post_ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $mapped_post_ids ) ) );
+
+		$missing_builder = array_values( array_diff( $final_post_ids, $fresh_read ) );
+		if ( ! empty( $missing_builder ) ) {
+			$this->debug_log( sprintf( 'Refresh quiz failed. missing_builder_ids=%s', wp_json_encode( $missing_builder ) ) );
+			return new WP_Error( 'lti_refresh_builder_incomplete', sprintf( 'Quiz refresh final incompleto: faltan IDs en builder final: %s', wp_json_encode( $missing_builder ) ) );
+		}
+
+		$created_post_ids = array();
+		$created_pro_ids  = array();
+		foreach ( (array) $created_questions as $entry ) {
+			if ( isset( $entry['post_id'] ) ) {
+				$created_post_ids[] = (int) $entry['post_id'];
+			}
+			if ( isset( $entry['pro_question_id'] ) ) {
+				$created_pro_ids[] = (int) $entry['pro_question_id'];
+			}
+		}
+		$created_post_ids = array_values( array_unique( array_filter( $created_post_ids ) ) );
+		$created_pro_ids  = array_values( array_unique( array_filter( $created_pro_ids ) ) );
+
+		if ( empty( $mapper_pro_ids ) ) {
+			$this->debug_log( 'Refresh quiz failed. mapper empty.' );
+			return new WP_Error( 'lti_refresh_mapper_empty', 'Quiz refresh final incompleto: mapper/WpProQuiz no refleja las preguntas persistidas' );
+		}
+
+		$created_missing = array_values( array_diff( $created_post_ids, $mapped_post_ids ) );
+		$pro_missing     = array_values( array_diff( $created_pro_ids, $mapper_pro_ids ) );
+		if ( ! empty( $created_missing ) && ! empty( $pro_missing ) ) {
+			$this->debug_log( sprintf( 'Refresh quiz failed. created_missing=%s | pro_missing=%s', wp_json_encode( $created_missing ), wp_json_encode( $pro_missing ) ) );
+			return new WP_Error( 'lti_refresh_mapper_incomplete', 'Quiz refresh final incompleto: mapper/WpProQuiz no refleja las preguntas persistidas' );
+		}
+
+		$this->debug_log( sprintf( 'Refresh quiz success. quiz_post_id=%d | quiz_pro_id=%d', (int) $quiz_post_id, (int) $quiz_pro_id ) );
+		return array(
+			'builder_ids'      => $fresh_read,
+			'mapper_pro_ids'   => $mapper_pro_ids,
+			'mapped_post_ids'  => $mapped_post_ids,
+		);
 	}
 
 	/**
@@ -1142,27 +1266,35 @@ class LTI_LearnDash_Service {
 	 * @return int
 	 */
 	private function get_question_post_id_by_pro_question_id( $pro_question_id ) {
+		global $wpdb;
+
 		$pro_question_id = (int) $pro_question_id;
 		if ( $pro_question_id <= 0 ) {
 			return 0;
 		}
 
-		$candidates = get_posts(
-			array(
-				'post_type'      => 'sfwd-question',
-				'post_status'    => array( 'publish', 'draft', 'private' ),
-				'posts_per_page' => 5,
-				'fields'         => 'ids',
-				'meta_query'     => array(
-					array(
-						'key'     => 'question_pro_id',
-						'value'   => (int) $pro_question_id,
-						'compare' => '=',
-						'type'    => 'NUMERIC',
-					),
-				),
-			)
+		$meta_keys = array(
+			'question_pro_id',
+			'_question_pro_id',
+			'ld_question_pro_id',
+			'quiz_question_pro_id',
 		);
+		$key_placeholders = implode( ',', array_fill( 0, count( $meta_keys ), '%s' ) );
+		$sql = $wpdb->prepare(
+			"
+			SELECT p.ID
+			FROM {$wpdb->posts} p
+			INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+			WHERE p.post_type = 'sfwd-question'
+			  AND p.post_status IN ('publish','draft','private')
+			  AND pm.meta_key IN ($key_placeholders)
+			  AND (pm.meta_value = %s OR pm.meta_value = %d)
+			ORDER BY p.ID ASC
+			",
+			array_merge( $meta_keys, array( (string) $pro_question_id, (int) $pro_question_id ) )
+		);
+		$candidates = $wpdb->get_col( $sql );
+		$candidates = array_values( array_unique( array_map( 'intval', (array) $candidates ) ) );
 
 		if ( ! empty( $candidates ) ) {
 			$chosen = (int) $candidates[0];
