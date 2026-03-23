@@ -216,7 +216,24 @@ class LTI_LearnDash_Service {
 	 */
 	private function resync_quiz_questions( $quiz_post_id, $quiz_pro_id, $new_questions ) {
 		$existing_builder_ids = $this->get_canonical_existing_builder_post_ids( (int) $quiz_post_id );
+		$rebuilt_existing_ids = $this->rebuild_existing_quiz_canonical_question_ids( (int) $quiz_post_id, (int) $quiz_pro_id );
 		$this->debug_log( sprintf( 'Resync start. quiz_post_id=%d | quiz_pro_id=%d | existing_builder_ids_canonical=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $existing_builder_ids ) ) );
+
+		if ( count( $rebuilt_existing_ids ) > count( $existing_builder_ids ) ) {
+			$this->debug_log( sprintf( 'Builder existing truncated repair needed. quiz_post_id=%d | before=%s | rebuilt=%s', (int) $quiz_post_id, wp_json_encode( $existing_builder_ids ), wp_json_encode( $rebuilt_existing_ids ) ) );
+			$repair_builder = array();
+			foreach ( $rebuilt_existing_ids as $idx => $qid ) {
+				$repair_builder[ (int) $qid ] = $idx + 1;
+			}
+			$repair_result = $this->persist_quiz_builder_questions( (int) $quiz_post_id, $repair_builder, $rebuilt_existing_ids );
+			if ( is_wp_error( $repair_result ) ) {
+				return $repair_result;
+			}
+			$existing_builder_ids = isset( $repair_result['builder_ids'] ) ? array_values( array_map( 'intval', (array) $repair_result['builder_ids'] ) ) : $rebuilt_existing_ids;
+			$this->debug_log( sprintf( 'Builder existing repaired ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $existing_builder_ids ) ) );
+		} else {
+			$existing_builder_ids = $rebuilt_existing_ids;
+		}
 
 		$current_ids = $existing_builder_ids;
 
@@ -256,6 +273,7 @@ class LTI_LearnDash_Service {
 		$this->debug_log( sprintf( 'Resync created pro_question_ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_pros ) ) );
 		$final_ids = array_values( array_unique( array_merge( $valid_ids, $new_valid_ids ) ) );
 		$this->debug_log( sprintf( 'Resync final_ids_to_persist. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $final_ids ) ) );
+		$this->debug_log( sprintf( 'Final ids after append new. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $final_ids ) ) );
 		$final_builder = array();
 		foreach ( $final_ids as $index => $question_id ) {
 			$final_builder[ (int) $question_id ] = $index + 1;
@@ -1052,6 +1070,110 @@ class LTI_LearnDash_Service {
 
 		$query_ids = $this->get_question_ids_linked_to_quiz( (int) $quiz_post_id );
 		return $this->normalize_builder_post_ids( array_values( array_map( 'intval', (array) $query_ids ) ) );
+	}
+
+	/**
+	 * Reconstrucción canónica de preguntas existentes (quiz ya creado) desde fuentes A/B/C.
+	 *
+	 * @param int $quiz_post_id
+	 * @param int $quiz_pro_id
+	 * @return int[]
+	 */
+	private function rebuild_existing_quiz_canonical_question_ids( $quiz_post_id, $quiz_pro_id ) {
+		$source_a = $this->get_builder_question_ids( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Rebuild existing source A builder ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $source_a ) ) );
+
+		$source_b = $this->normalize_builder_post_ids( $this->get_question_ids_linked_to_quiz( (int) $quiz_post_id ) );
+		$this->debug_log( sprintf( 'Rebuild existing source B relation ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $source_b ) ) );
+
+		$source_c_pro_ids  = $this->get_proquiz_online_question_ids_for_quiz( (int) $quiz_pro_id );
+		$source_c_post_ids = array();
+		foreach ( $source_c_pro_ids as $pro_id ) {
+			$post_id = $this->get_question_post_id_by_pro_question_id( (int) $pro_id );
+			if ( $post_id > 0 ) {
+				$source_c_post_ids[] = (int) $post_id;
+			}
+		}
+		$source_c_post_ids = $this->normalize_builder_post_ids( $source_c_post_ids );
+		$this->debug_log( sprintf( 'Rebuild existing source C sql pro_ids. quiz_pro_id=%d | pro_ids=%s', (int) $quiz_pro_id, wp_json_encode( $source_c_pro_ids ) ) );
+		$this->debug_log( sprintf( 'Rebuild existing source C mapped post_ids. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $source_c_post_ids ) ) );
+
+		$final = array();
+		foreach ( array( $source_a, $source_b, $source_c_post_ids ) as $source ) {
+			foreach ( (array) $source as $post_id ) {
+				$post_id = (int) $post_id;
+				if ( $post_id > 0 && ! in_array( $post_id, $final, true ) ) {
+					$final[] = $post_id;
+				}
+			}
+		}
+
+		$this->debug_log( sprintf( 'Rebuild existing final canonical ids. quiz_post_id=%d | quiz_pro_id=%d | ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final ) ) );
+		return array_values( $final );
+	}
+
+	/**
+	 * @param int $quiz_pro_id
+	 * @return int[]
+	 */
+	private function get_proquiz_online_question_ids_for_quiz( $quiz_pro_id ) {
+		global $wpdb;
+
+		if ( $quiz_pro_id <= 0 ) {
+			return array();
+		}
+
+		$mapper = class_exists( 'WpProQuiz_Model_QuestionMapper' ) ? new WpProQuiz_Model_QuestionMapper() : null;
+		$table  = $this->get_proquiz_question_table_name( $mapper );
+		if ( '' === $table ) {
+			return array();
+		}
+
+		$sql = $wpdb->prepare(
+			"SELECT id FROM {$table} WHERE quiz_id = %d AND online = 1 ORDER BY sort ASC, id ASC",
+			(int) $quiz_pro_id
+		);
+		$ids = $wpdb->get_col( $sql );
+		return array_values( array_map( 'intval', (array) $ids ) );
+	}
+
+	/**
+	 * @param int $pro_question_id
+	 * @return int
+	 */
+	private function get_question_post_id_by_pro_question_id( $pro_question_id ) {
+		$pro_question_id = (int) $pro_question_id;
+		if ( $pro_question_id <= 0 ) {
+			return 0;
+		}
+
+		$candidates = get_posts(
+			array(
+				'post_type'      => 'sfwd-question',
+				'post_status'    => array( 'publish', 'draft', 'private' ),
+				'posts_per_page' => 5,
+				'fields'         => 'ids',
+				'meta_query'     => array(
+					array(
+						'key'     => 'question_pro_id',
+						'value'   => (int) $pro_question_id,
+						'compare' => '=',
+						'type'    => 'NUMERIC',
+					),
+				),
+			)
+		);
+
+		if ( ! empty( $candidates ) ) {
+			$chosen = (int) $candidates[0];
+			if ( count( $candidates ) > 1 ) {
+				$this->debug_log( sprintf( 'get_question_post_id_by_pro_question_id multiple candidates. pro_id=%d | ids=%s | chosen=%d', (int) $pro_question_id, wp_json_encode( $candidates ), $chosen ) );
+			}
+			return $chosen;
+		}
+
+		$this->debug_log( sprintf( 'get_question_post_id_by_pro_question_id no match. pro_id=%d', (int) $pro_question_id ) );
+		return 0;
 	}
 
 	/**
