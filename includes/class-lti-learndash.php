@@ -937,6 +937,8 @@ class LTI_LearnDash_Service {
 			'file'    => '',
 			'methods' => array(),
 			'set_questions_source' => '',
+			'get_questions_source' => '',
+			'get_questions_types'  => array(),
 		);
 
 		if ( ! is_object( $store ) ) {
@@ -979,6 +981,23 @@ class LTI_LearnDash_Service {
 						}
 					}
 				}
+
+				if ( 'get_questions' === $name ) {
+					$start = (int) $method->getStartLine();
+					$end   = (int) $method->getEndLine();
+					$file  = (string) $method->getFileName();
+					if ( $file && file_exists( $file ) ) {
+						$lines = file( $file );
+						if ( is_array( $lines ) ) {
+							$source                           = implode( '', array_slice( $lines, max( 0, $start - 1 ), max( 0, $end - $start + 1 ) ) );
+							$details['get_questions_source']  = trim( preg_replace( '/\s+/', ' ', (string) $source ) );
+							preg_match_all( "/'([a-z_]+)'/", (string) $source, $matches );
+							if ( ! empty( $matches[1] ) ) {
+								$details['get_questions_types'] = array_values( array_unique( array_map( 'sanitize_key', $matches[1] ) ) );
+							}
+						}
+					}
+				}
 			}
 		} catch ( Exception $e ) {
 			$this->debug_log( 'inspect_quiz_questions_store error: ' . $e->getMessage() );
@@ -994,8 +1013,9 @@ class LTI_LearnDash_Service {
 	private function get_builder_question_ids( $quiz_post_id ) {
 		$store = $this->get_quiz_questions_store( (int) $quiz_post_id );
 		if ( is_object( $store ) && method_exists( $store, 'get_questions' ) ) {
-			$ids = $store->get_questions( 'ids' );
-			return $this->extract_question_post_ids_from_builder( is_array( $ids ) ? $ids : array() );
+			$post_ids = $store->get_questions( 'post_ids' );
+			$this->debug_log( sprintf( 'Builder get_questions(post_ids). quiz_post_id=%d | value=%s', (int) $quiz_post_id, wp_json_encode( $post_ids ) ) );
+			return $this->extract_question_post_ids_from_builder( is_array( $post_ids ) ? $post_ids : array() );
 		}
 
 		if ( function_exists( 'learndash_get_quiz_questions' ) ) {
