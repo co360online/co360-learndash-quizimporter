@@ -391,19 +391,21 @@ class LTI_LearnDash_Service {
 	 * @return void
 	 */
 	private function sync_proquiz_question_quiz_relation( $question_pro_id, $quiz_pro_id ) {
-		if ( ! class_exists( 'WpProQuiz_Model_QuestionMapper' ) || ! class_exists( 'WpProQuiz_Model_Question' ) ) {
+		if ( ! class_exists( 'WpProQuiz_Model_QuestionMapper' ) ) {
 			return;
 		}
 
 		try {
 			$mapper = new WpProQuiz_Model_QuestionMapper();
-			if ( method_exists( $mapper, 'fetch' ) ) {
-				$question = $mapper->fetch( (int) $question_pro_id );
-				if ( $question && is_object( $question ) && method_exists( $question, 'setQuizId' ) ) {
-					$question->setQuizId( (int) $quiz_pro_id );
-					$mapper->save( $question );
-				}
-			}
+			$this->update_proquiz_question_row(
+				$mapper,
+				(int) $question_pro_id,
+				array(
+					'quiz_id' => (int) $quiz_pro_id,
+					'online'  => 1,
+				),
+				'sync_proquiz_question_quiz_relation'
+			);
 		} catch ( Exception $e ) {
 			$this->debug_log( 'sync_proquiz_question_quiz_relation error: ' . $e->getMessage() );
 		}
@@ -428,6 +430,7 @@ class LTI_LearnDash_Service {
 		if ( ! method_exists( $mapper, 'fetchAll' ) ) {
 			return true;
 		}
+		$this->log_mapper_fetchall_diagnostics( $mapper, (int) $quiz_pro_id, (array) $new_valid_pro_ids );
 
 		try {
 			$current_models = $mapper->fetchAll( (int) $quiz_pro_id );
@@ -473,22 +476,22 @@ class LTI_LearnDash_Service {
 
 		$position = 1;
 		foreach ( $final_pro_ids as $pro_id ) {
-			if ( method_exists( $mapper, 'fetch' ) && method_exists( $mapper, 'save' ) ) {
+			if ( method_exists( $mapper, 'fetch' ) ) {
 				$model = $mapper->fetch( (int) $pro_id );
 				if ( $model && is_object( $model ) ) {
 					$before_id = method_exists( $model, 'getId' ) ? (int) $model->getId() : 0;
 					$before_qz = method_exists( $model, 'getQuizId' ) ? (int) $model->getQuizId() : 0;
 					$this->debug_log( sprintf( 'ProQuiz fetch model before save. pro_id=%d | model_id=%d | model_quiz_id=%d', (int) $pro_id, $before_id, $before_qz ) );
-					if ( method_exists( $model, 'setQuizId' ) ) {
-						$model->setQuizId( (int) $quiz_pro_id );
-					}
-					if ( method_exists( $model, 'setSort' ) ) {
-						$model->setSort( (int) $position );
-					}
-					if ( method_exists( $model, 'setOnline' ) ) {
-						$model->setOnline( true );
-					}
-					$mapper->save( $model );
+					$this->update_proquiz_question_row(
+						$mapper,
+						(int) $pro_id,
+						array(
+							'quiz_id' => (int) $quiz_pro_id,
+							'sort'    => (int) $position,
+							'online'  => 1,
+						),
+						'resync_proquiz_questions_layer'
+					);
 					$after_id = method_exists( $model, 'getId' ) ? (int) $model->getId() : 0;
 					$after_qz = method_exists( $model, 'getQuizId' ) ? (int) $model->getQuizId() : 0;
 					$this->debug_log( sprintf( 'ProQuiz model after save. pro_id=%d | model_id=%d | model_quiz_id=%d', (int) $pro_id, $after_id, $after_qz ) );
@@ -934,24 +937,11 @@ class LTI_LearnDash_Service {
 			return;
 		}
 
-		$candidates = array(
-			$wpdb->prefix . 'wp_pro_quiz_question',
-			$wpdb->base_prefix . 'wp_pro_quiz_question',
-			$wpdb->prefix . 'pro_quiz_question',
-			$wpdb->base_prefix . 'pro_quiz_question',
-		);
-
-		$table_name = '';
-		foreach ( array_unique( $candidates ) as $candidate ) {
-			$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $candidate ) );
-			if ( $exists === $candidate ) {
-				$table_name = $candidate;
-				break;
-			}
-		}
+		$mapper     = class_exists( 'WpProQuiz_Model_QuestionMapper' ) ? new WpProQuiz_Model_QuestionMapper() : null;
+		$table_name = $this->get_proquiz_question_table_name( $mapper );
 
 		if ( '' === $table_name ) {
-			$this->debug_log( sprintf( 'DB diag %s: question table not found. candidates=%s', $context, wp_json_encode( $candidates ) ) );
+			$this->debug_log( sprintf( 'DB diag %s: mapper question table not resolved.', $context ) );
 			return;
 		}
 
@@ -980,6 +970,153 @@ class LTI_LearnDash_Service {
 				wp_json_encode( $normalized )
 			)
 		);
+	}
+
+	/**
+	 * Actualiza columnas directas de la tabla real de preguntas ProQuiz.
+	 *
+	 * @param object $mapper
+	 * @param int    $question_pro_id
+	 * @param array  $fields
+	 * @param string $context
+	 * @return void
+	 */
+	private function update_proquiz_question_row( $mapper, $question_pro_id, $fields, $context ) {
+		global $wpdb;
+
+		$question_pro_id = (int) $question_pro_id;
+		$fields          = is_array( $fields ) ? $fields : array();
+		if ( $question_pro_id <= 0 || empty( $fields ) ) {
+			return;
+		}
+
+		$table_name = $this->get_proquiz_question_table_name( $mapper );
+		if ( '' === $table_name ) {
+			$this->debug_log( sprintf( 'ProQuiz SQL update skipped (%s): table not resolved. pro_id=%d', $context, $question_pro_id ) );
+			return;
+		}
+
+		$allowed = array( 'quiz_id', 'sort', 'online' );
+		$data    = array();
+		$formats = array();
+		foreach ( $allowed as $column ) {
+			if ( array_key_exists( $column, $fields ) ) {
+				$data[ $column ] = (int) $fields[ $column ];
+				$formats[]       = '%d';
+			}
+		}
+
+		if ( empty( $data ) ) {
+			return;
+		}
+
+		$result = $wpdb->update( $table_name, $data, array( 'id' => $question_pro_id ), $formats, array( '%d' ) );
+		$this->debug_log(
+			sprintf(
+				'ProQuiz SQL update (%s). table=%s | pro_id=%d | data=%s | result=%s',
+				$context,
+				$table_name,
+				$question_pro_id,
+				wp_json_encode( $data ),
+				wp_json_encode( $result )
+			)
+		);
+	}
+
+	/**
+	 * Obtiene el nombre de tabla real de preguntas usado por el mapper.
+	 *
+	 * @param object|null $mapper
+	 * @return string
+	 */
+	private function get_proquiz_question_table_name( $mapper = null ) {
+		global $wpdb;
+
+		if ( ! $mapper || ! is_object( $mapper ) ) {
+			if ( ! class_exists( 'WpProQuiz_Model_QuestionMapper' ) ) {
+				return '';
+			}
+			$mapper = new WpProQuiz_Model_QuestionMapper();
+		}
+
+		$properties = array( '_table', 'table', 'questionTable', '_questionTable' );
+		foreach ( $properties as $property_name ) {
+			try {
+				$reflection = new ReflectionObject( $mapper );
+				while ( $reflection ) {
+					if ( $reflection->hasProperty( $property_name ) ) {
+						$property = $reflection->getProperty( $property_name );
+						$property->setAccessible( true );
+						$value = (string) $property->getValue( $mapper );
+						if ( '' !== $value ) {
+							return $value;
+						}
+					}
+					$reflection = $reflection->getParentClass();
+				}
+			} catch ( Exception $e ) {
+				$this->debug_log( 'get_proquiz_question_table_name reflection error: ' . $e->getMessage() );
+			}
+		}
+
+		$fallbacks = array(
+			$wpdb->prefix . 'wp_pro_quiz_question',
+			$wpdb->base_prefix . 'wp_pro_quiz_question',
+			$wpdb->prefix . 'pro_quiz_question',
+			$wpdb->base_prefix . 'pro_quiz_question',
+		);
+		foreach ( array_unique( $fallbacks ) as $fallback ) {
+			$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $fallback ) );
+			if ( $exists === $fallback ) {
+				return $fallback;
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Log de inspección del método real fetchAll() cargado en runtime.
+	 *
+	 * @param object $mapper
+	 * @param int    $quiz_pro_id
+	 * @param int[]  $pro_ids
+	 * @return void
+	 */
+	private function log_mapper_fetchall_diagnostics( $mapper, $quiz_pro_id, $pro_ids = array() ) {
+		if ( ! is_object( $mapper ) || ! method_exists( $mapper, 'fetchAll' ) ) {
+			return;
+		}
+
+		try {
+			$method = new ReflectionMethod( $mapper, 'fetchAll' );
+			$file   = $method->getFileName();
+			$start  = (int) $method->getStartLine();
+			$end    = (int) $method->getEndLine();
+			$body   = '';
+			if ( $file && file_exists( $file ) ) {
+				$lines = file( $file );
+				if ( is_array( $lines ) ) {
+					$body = implode( '', array_slice( $lines, max( 0, $start - 1 ), max( 0, $end - $start + 1 ) ) );
+				}
+			}
+
+			$table_name = $this->get_proquiz_question_table_name( $mapper );
+			$this->debug_log(
+				sprintf(
+					'Mapper fetchAll source. file=%s | lines=%d-%d | table=%s | quiz_pro_id=%d | source=%s',
+					(string) $file,
+					$start,
+					$end,
+					(string) $table_name,
+					(int) $quiz_pro_id,
+					wp_json_encode( trim( preg_replace( '/\s+/', ' ', (string) $body ) ) )
+				)
+			);
+			$this->log_proquiz_question_rows( (array) $pro_ids, 'fetchall_source_diag', (int) $quiz_pro_id );
+		} catch ( Exception $e ) {
+			$this->debug_log( 'log_mapper_fetchall_diagnostics error: ' . $e->getMessage() );
+		}
 	}
 
 	/**
