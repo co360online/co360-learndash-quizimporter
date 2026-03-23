@@ -267,6 +267,10 @@ class LTI_LearnDash_Service {
 		$this->debug_log( sprintf( 'Resync invalid discarded. quiz_post_id=%d | items=%s', (int) $quiz_post_id, wp_json_encode( $invalid_map ) ) );
 		$this->debug_log( sprintf( 'Resync new added. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_ids ) ) );
 
+		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
+			learndash_set_quiz_questions( (int) $quiz_post_id, $final_builder );
+		}
+
 		$builder_persist = $this->persist_quiz_builder_questions( (int) $quiz_post_id, $final_builder, $final_ids );
 		if ( is_wp_error( $builder_persist ) ) {
 			return $builder_persist;
@@ -870,7 +874,7 @@ class LTI_LearnDash_Service {
 	 */
 	private function persist_quiz_builder_questions( $quiz_post_id, $builder_map, $builder_ids ) {
 		$builder_map = is_array( $builder_map ) ? $builder_map : array();
-		$builder_ids = array_values( array_unique( array_map( 'intval', (array) $builder_ids ) ) );
+		$builder_ids = array_values( array_map( 'intval', (array) $builder_ids ) );
 
 		$quiz_questions = $this->get_quiz_questions_store( (int) $quiz_post_id );
 		if ( ! is_object( $quiz_questions ) ) {
@@ -885,11 +889,11 @@ class LTI_LearnDash_Service {
 		}
 
 		try {
-			$quiz_questions->set_questions( $builder_map );
+			$quiz_questions->set_questions( $builder_ids );
 		} catch ( Exception $e ) {
 			return new WP_Error( 'lti_builder_set_questions_error', $e->getMessage() );
 		}
-		$this->debug_log( sprintf( 'Builder persist via LDLMS object. quiz_post_id=%d | called=%s', (int) $quiz_post_id, wp_json_encode( array( 'set_questions(map)' ) ) ) );
+		$this->debug_log( sprintf( 'Builder persist via LDLMS object. quiz_post_id=%d | called=%s | ids=%s', (int) $quiz_post_id, wp_json_encode( array( 'set_questions(ids)' ) ), wp_json_encode( $builder_ids ) ) );
 
 		clean_post_cache( (int) $quiz_post_id );
 		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
