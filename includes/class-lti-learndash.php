@@ -87,8 +87,8 @@ class LTI_LearnDash_Service {
 		}
 
 		$this->link_quiz_post_to_pro_quiz( (int) $quiz_post_id, (int) $pro_quiz_id );
-
 		$created_questions = $this->create_and_attach_questions( (int) $quiz_post_id, (int) $pro_quiz_id, $items, true );
+
 		if ( is_wp_error( $created_questions ) ) {
 			wp_delete_post( (int) $quiz_post_id, true );
 			$result->add_error( $created_questions->get_error_message() );
@@ -104,7 +104,7 @@ class LTI_LearnDash_Service {
 	}
 
 	/**
-	 * Añade preguntas a un quiz existente.
+	 * Añade preguntas a un quiz existente y reconstruye/sincroniza por completo el quiz.
 	 *
 	 * @param int                            $quiz_post_id
 	 * @param array<int,array<string,mixed>> $items
@@ -119,7 +119,7 @@ class LTI_LearnDash_Service {
 		}
 
 		$pro_quiz_id = $this->get_pro_quiz_id_for_post( (int) $quiz_post_id );
-		$this->debug_log( sprintf( 'Modo quiz existente. quiz_post_id=%d | quiz_pro_id_resuelto=%d', (int) $quiz_post_id, (int) $pro_quiz_id ) );
+		$this->debug_log( sprintf( 'Modo quiz existente. quiz_post_id=%d | quiz_pro_id=%d', (int) $quiz_post_id, (int) $pro_quiz_id ) );
 		if ( $pro_quiz_id <= 0 ) {
 			$result->add_error( 'No se pudo localizar el ID interno de LearnDash para el quiz seleccionado.' );
 			return $result;
@@ -130,6 +130,15 @@ class LTI_LearnDash_Service {
 			$result->add_error( $created_questions->get_error_message() );
 			return $result;
 		}
+
+		$new_question_ids = array_map(
+			static function ( $entry ) {
+				return isset( $entry['post_id'] ) ? (int) $entry['post_id'] : 0;
+			},
+			$created_questions
+		);
+
+		$this->resync_quiz_questions( (int) $quiz_post_id, (int) $pro_quiz_id, $new_question_ids );
 
 		return $this->build_success_result(
 			'add_existing',
@@ -176,32 +185,339 @@ class LTI_LearnDash_Service {
 
 			$this->debug_log(
 				sprintf(
-					'Pregunta vinculada. question_post_id=%d | question_pro_id=%d | quiz_post_id=%d | quiz_pro_id=%d',
-					(int) $question_post_id,
-					(int) $pro_question_id,
+					'Pregunta creada y vinculada. quiz_post_id=%d | quiz_pro_id=%d | question_post_id=%d | question_pro_id=%d',
 					(int) $quiz_post_id,
-					(int) $pro_quiz_id
+					(int) $pro_quiz_id,
+					(int) $question_post_id,
+					(int) $pro_question_id
 				)
 			);
 		}
 
-		if ( ! $is_new_quiz ) {
-			$new_question_ids = array_map(
-				static function ( $entry ) {
-					return isset( $entry['post_id'] ) ? (int) $entry['post_id'] : 0;
-				},
-				$created
-			);
-			$this->rebuild_existing_quiz_builder( (int) $quiz_post_id, $new_question_ids );
-		}
-
 		if ( $is_new_quiz ) {
 			$this->debug_log( sprintf( 'Quiz nuevo completado. quiz_post_id=%d', (int) $quiz_post_id ) );
-		} else {
-			$this->debug_log( sprintf( 'Quiz existente actualizado. quiz_post_id=%d', (int) $quiz_post_id ) );
 		}
 
 		return $created;
+	}
+
+	/**
+	 * Reconstruye y resincroniza por completo preguntas de quiz existente.
+	 *
+	 * @param int   $quiz_post_id
+	 * @param int   $quiz_pro_id
+	 * @param int[] $new_question_ids
+	 * @return void
+	 */
+	private function resync_quiz_questions( $quiz_post_id, $quiz_pro_id, $new_question_ids ) {
+		$builder_original = function_exists( 'learndash_get_quiz_questions' ) ? learndash_get_quiz_questions( (int) $quiz_post_id ) : array();
+		$this->debug_log( sprintf( 'Resync start. quiz_post_id=%d | quiz_pro_id=%d | builder_original=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $builder_original ) ) );
+
+		$builder_ids = $this->extract_question_post_ids_from_builder( $builder_original );
+		$query_ids   = $this->get_question_ids_linked_to_quiz( (int) $quiz_post_id );
+		$current_ids = array_values( array_unique( array_merge( $builder_ids, $query_ids ) ) );
+
+		$this->debug_log( sprintf( 'Resync detected current question IDs. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $current_ids ) ) );
+
+		$valid_ids   = array();
+		$invalid_map = array();
+
+		foreach ( $current_ids as $question_id ) {
+			$validation = $this->validate_question_for_quiz_resync( (int) $question_id, (int) $quiz_post_id );
+			if ( true === $validation['valid'] ) {
+				$valid_ids[] = (int) $question_id;
+			} else {
+				$invalid_map[] = array(
+					'question_id' => (int) $question_id,
+					'reason'      => $validation['reason'],
+				);
+			}
+		}
+
+		$new_valid_ids = array();
+		foreach ( $new_question_ids as $question_id ) {
+			$validation = $this->validate_question_for_quiz_resync( (int) $question_id, (int) $quiz_post_id );
+			if ( true === $validation['valid'] ) {
+				$new_valid_ids[] = (int) $question_id;
+			} else {
+				$invalid_map[] = array(
+					'question_id' => (int) $question_id,
+					'reason'      => 'new_question_invalid: ' . $validation['reason'],
+				);
+			}
+		}
+
+		$final_ids = array_values( array_unique( array_merge( $valid_ids, $new_valid_ids ) ) );
+		$final_builder = array();
+		foreach ( $final_ids as $index => $question_id ) {
+			$final_builder[ (int) $question_id ] = $index + 1;
+		}
+
+		$this->debug_log( sprintf( 'Resync valid kept. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $valid_ids ) ) );
+		$this->debug_log( sprintf( 'Resync invalid discarded. quiz_post_id=%d | items=%s', (int) $quiz_post_id, wp_json_encode( $invalid_map ) ) );
+		$this->debug_log( sprintf( 'Resync new added. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $new_valid_ids ) ) );
+
+		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
+			learndash_set_quiz_questions( (int) $quiz_post_id, $final_builder );
+		}
+
+		foreach ( $final_ids as $question_id ) {
+			$this->sync_question_quiz_relations( (int) $question_id, (int) $quiz_post_id, (int) $quiz_pro_id );
+		}
+
+		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
+			learndash_update_quiz_questions( (int) $quiz_post_id );
+		}
+
+		clean_post_cache( (int) $quiz_post_id );
+		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
+		do_action( 'learndash_quiz_questions_updated', (int) $quiz_post_id, $final_builder );
+
+		$builder_after = function_exists( 'learndash_get_quiz_questions' ) ? learndash_get_quiz_questions( (int) $quiz_post_id ) : array();
+		$this->debug_log( sprintf( 'Resync end. quiz_post_id=%d | quiz_pro_id=%d | final_builder_saved=%s | final_builder_read=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final_builder ), wp_json_encode( $builder_after ) ) );
+	}
+
+	/**
+	 * Valida si la pregunta puede participar en el builder final del quiz.
+	 *
+	 * @param int $question_post_id
+	 * @param int $quiz_post_id
+	 * @return array<string,mixed>
+	 */
+	private function validate_question_for_quiz_resync( $question_post_id, $quiz_post_id ) {
+		if ( $question_post_id <= 0 ) {
+			return array( 'valid' => false, 'reason' => 'id_invalido' );
+		}
+
+		$post = get_post( (int) $question_post_id );
+		if ( ! $post || 'sfwd-question' !== $post->post_type ) {
+			return array( 'valid' => false, 'reason' => 'post_no_existe_o_tipo_invalido' );
+		}
+
+		if ( in_array( $post->post_status, array( 'trash', 'auto-draft' ), true ) ) {
+			return array( 'valid' => false, 'reason' => 'post_en_papelera_o_borrador_auto' );
+		}
+
+		$question_pro_id = (int) get_post_meta( (int) $question_post_id, 'question_pro_id', true );
+		if ( $question_pro_id <= 0 ) {
+			if ( function_exists( 'learndash_get_setting' ) ) {
+				$question_pro_id = (int) learndash_get_setting( (int) $question_post_id, 'question_pro_id' );
+			}
+		}
+
+		if ( $question_pro_id <= 0 ) {
+			return array( 'valid' => false, 'reason' => 'question_pro_id_invalido' );
+		}
+
+		$linked_quiz_id = (int) get_post_meta( (int) $question_post_id, 'quiz_id', true );
+		if ( $linked_quiz_id > 0 && $linked_quiz_id !== (int) $quiz_post_id ) {
+			return array( 'valid' => false, 'reason' => 'quiz_id_inconsistente' );
+		}
+
+		return array( 'valid' => true, 'reason' => '' );
+	}
+
+	/**
+	 * Sincroniza explícitamente las relaciones internas/meta de una pregunta con el quiz.
+	 *
+	 * @param int $question_post_id
+	 * @param int $quiz_post_id
+	 * @param int $quiz_pro_id
+	 * @return void
+	 */
+	private function sync_question_quiz_relations( $question_post_id, $quiz_post_id, $quiz_pro_id ) {
+		$question_pro_id = (int) get_post_meta( (int) $question_post_id, 'question_pro_id', true );
+		if ( $question_pro_id <= 0 && function_exists( 'learndash_get_setting' ) ) {
+			$question_pro_id = (int) learndash_get_setting( (int) $question_post_id, 'question_pro_id' );
+		}
+
+		if ( $question_pro_id <= 0 ) {
+			$this->debug_log( sprintf( 'Sync skipped: question_pro_id invalido. question_post_id=%d', (int) $question_post_id ) );
+			return;
+		}
+
+		update_post_meta( (int) $question_post_id, 'quiz_id', (int) $quiz_post_id );
+		update_post_meta( (int) $question_post_id, 'question_pro_id', (int) $question_pro_id );
+
+		if ( function_exists( 'learndash_update_setting' ) ) {
+			learndash_update_setting( (int) $question_post_id, 'quiz', (int) $quiz_post_id );
+			learndash_update_setting( (int) $question_post_id, 'quiz_pro_id', (int) $quiz_pro_id );
+			learndash_update_setting( (int) $question_post_id, 'question_pro_id', (int) $question_pro_id );
+		}
+
+		if ( function_exists( 'learndash_proquiz_sync_question_fields' ) ) {
+			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $question_pro_id );
+		}
+
+		$this->sync_proquiz_question_quiz_relation( (int) $question_pro_id, (int) $quiz_pro_id );
+
+		$this->debug_log(
+			sprintf(
+				'Sync question relation. quiz_post_id=%d | quiz_pro_id=%d | question_post_id=%d | question_pro_id=%d',
+				(int) $quiz_post_id,
+				(int) $quiz_pro_id,
+				(int) $question_post_id,
+				(int) $question_pro_id
+			)
+		);
+	}
+
+	/**
+	 * Fuerza relación interna en WpProQuiz (tabla de preguntas) con el quiz_pro_id.
+	 *
+	 * @param int $question_pro_id
+	 * @param int $quiz_pro_id
+	 * @return void
+	 */
+	private function sync_proquiz_question_quiz_relation( $question_pro_id, $quiz_pro_id ) {
+		if ( ! class_exists( 'WpProQuiz_Model_QuestionMapper' ) || ! class_exists( 'WpProQuiz_Model_Question' ) ) {
+			return;
+		}
+
+		try {
+			$mapper = new WpProQuiz_Model_QuestionMapper();
+			if ( method_exists( $mapper, 'fetch' ) ) {
+				$question = $mapper->fetch( (int) $question_pro_id );
+				if ( $question && is_object( $question ) && method_exists( $question, 'setQuizId' ) ) {
+					$question->setQuizId( (int) $quiz_pro_id );
+					$mapper->save( $question );
+				}
+			}
+		} catch ( Exception $e ) {
+			$this->debug_log( 'sync_proquiz_question_quiz_relation error: ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * @param int $quiz_post_id
+	 * @return int[]
+	 */
+	private function get_question_ids_linked_to_quiz( $quiz_post_id ) {
+		$query = get_posts(
+			array(
+				'post_type'      => 'sfwd-question',
+				'post_status'    => array( 'publish', 'draft', 'private' ),
+				'fields'         => 'ids',
+				'posts_per_page' => -1,
+				'meta_query'     => array(
+					'relation' => 'OR',
+					array(
+						'key'     => 'quiz_id',
+						'value'   => (int) $quiz_post_id,
+						'compare' => '=',
+					),
+					array(
+						'key'     => 'ld_quiz_id',
+						'value'   => (int) $quiz_post_id,
+						'compare' => '=',
+					),
+				),
+			)
+		);
+
+		return array_values( array_unique( array_map( 'intval', $query ) ) );
+	}
+
+	/**
+	 * Extrae IDs de preguntas del builder sin asumir una sola forma.
+	 *
+	 * @param mixed $builder_data
+	 * @return int[]
+	 */
+	private function extract_question_post_ids_from_builder( $builder_data ) {
+		$ids = array();
+
+		if ( ! is_array( $builder_data ) ) {
+			return $ids;
+		}
+
+		if ( isset( $builder_data['questions'] ) && is_array( $builder_data['questions'] ) ) {
+			return $this->extract_question_post_ids_from_builder( $builder_data['questions'] );
+		}
+
+		if ( $this->is_assoc_array( $builder_data ) && $this->all_keys_numeric( $builder_data ) ) {
+			$ids = array_map( 'intval', array_keys( $builder_data ) );
+			return array_values( array_unique( array_filter( $ids ) ) );
+		}
+
+		$first = reset( $builder_data );
+		if ( ! $this->is_assoc_array( $builder_data ) && is_numeric( $first ) ) {
+			$ids = array_map( 'intval', $builder_data );
+			return array_values( array_unique( array_filter( $ids ) ) );
+		}
+
+		foreach ( $builder_data as $value ) {
+			if ( ! is_array( $value ) ) {
+				continue;
+			}
+
+			if ( isset( $value['question_id'] ) && is_numeric( $value['question_id'] ) ) {
+				$ids[] = (int) $value['question_id'];
+			}
+			if ( isset( $value['post_id'] ) && is_numeric( $value['post_id'] ) ) {
+				$ids[] = (int) $value['post_id'];
+			}
+			if ( isset( $value['id'] ) && is_numeric( $value['id'] ) ) {
+				$ids[] = (int) $value['id'];
+			}
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'intval', $ids ) ) ) );
+	}
+
+	/**
+	 * @param int $question_post_id
+	 * @param int $quiz_post_id
+	 * @param int $pro_question_id
+	 * @param bool $update_builder
+	 * @return void
+	 */
+	private function link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id, $update_builder = true ) {
+		update_post_meta( $question_post_id, 'question_pro_id', (int) $pro_question_id );
+
+		if ( function_exists( 'learndash_update_setting' ) ) {
+			learndash_update_setting( $question_post_id, 'quiz', (int) $quiz_post_id );
+			learndash_update_setting( $question_post_id, 'question_pro_id', (int) $pro_question_id );
+			$quiz_pro_id = $this->get_pro_quiz_id_for_post( (int) $quiz_post_id );
+			if ( $quiz_pro_id > 0 ) {
+				learndash_update_setting( $question_post_id, 'quiz_pro_id', (int) $quiz_pro_id );
+			}
+		}
+
+		update_post_meta( $question_post_id, 'quiz_id', (int) $quiz_post_id );
+
+		if ( function_exists( 'learndash_proquiz_sync_question_fields' ) ) {
+			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $pro_question_id );
+		}
+
+		if ( $update_builder ) {
+			$this->update_quiz_builder_questions( (int) $quiz_post_id, (int) $question_post_id );
+		}
+	}
+
+	/**
+	 * Actualiza builder para flujo de quiz nuevo.
+	 *
+	 * @param int $quiz_post_id
+	 * @param int $question_post_id
+	 * @return void
+	 */
+	private function update_quiz_builder_questions( $quiz_post_id, $question_post_id ) {
+		if ( ! function_exists( 'learndash_get_quiz_questions' ) || ! function_exists( 'learndash_set_quiz_questions' ) ) {
+			return;
+		}
+
+		$questions_before = learndash_get_quiz_questions( (int) $quiz_post_id );
+		if ( ! is_array( $questions_before ) ) {
+			$questions_before = array();
+		}
+
+		if ( ! isset( $questions_before[ (int) $question_post_id ] ) ) {
+			$next_order = empty( $questions_before ) ? 1 : ( max( array_map( 'intval', array_values( $questions_before ) ) ) + 1 );
+			$questions_before[ (int) $question_post_id ] = $next_order;
+		}
+
+		learndash_set_quiz_questions( (int) $quiz_post_id, $questions_before );
 	}
 
 	/**
@@ -249,21 +565,6 @@ class LTI_LearnDash_Service {
 	}
 
 	/**
-	 * @param int $quiz_post_id
-	 * @param int $pro_quiz_id
-	 * @return void
-	 */
-	private function link_quiz_post_to_pro_quiz( $quiz_post_id, $pro_quiz_id ) {
-		update_post_meta( $quiz_post_id, 'quiz_pro_id', (int) $pro_quiz_id );
-
-		if ( function_exists( 'learndash_update_setting' ) ) {
-			learndash_update_setting( $quiz_post_id, 'quiz_pro', (int) $pro_quiz_id );
-		}
-	}
-
-	/**
-	 * Crea exclusivamente el post de la pregunta (sin vínculo aún).
-	 *
 	 * @param array<string,mixed> $item
 	 * @return int|WP_Error
 	 */
@@ -281,9 +582,6 @@ class LTI_LearnDash_Service {
 		}
 
 		update_post_meta( (int) $question_post_id, 'lti_general_feedback', sanitize_textarea_field( (string) $item['comment'] ) );
-
-		$this->debug_log( sprintf( 'Post de pregunta creado. question_post_id=%d', (int) $question_post_id ) );
-
 		return (int) $question_post_id;
 	}
 
@@ -328,14 +626,6 @@ class LTI_LearnDash_Service {
 				return new WP_Error( 'lti_pro_question_id_invalid', 'No se pudo determinar el ID interno de la pregunta creada.' );
 			}
 
-			$this->debug_log(
-				sprintf(
-					'Pregunta interna creada. question_pro_id=%d | quiz_pro_id=%d',
-					(int) $question_id,
-					(int) $pro_quiz_id
-				)
-			);
-
 			return (int) $question_id;
 		} catch ( Exception $e ) {
 			return new WP_Error( 'lti_pro_question_error', $e->getMessage() );
@@ -343,288 +633,10 @@ class LTI_LearnDash_Service {
 	}
 
 	/**
-	 * Vincula post de pregunta de WP con su pregunta interna de WpProQuiz y con el quiz.
-	 *
-	 * @param int $question_post_id
-	 * @param int $quiz_post_id
-	 * @param int $pro_question_id
-	 * @return void
+	 * @param object     $model
+	 * @param mixed|null $save_result
+	 * @return int
 	 */
-	private function link_question_post_to_pro_question( $question_post_id, $quiz_post_id, $pro_question_id, $update_builder = true ) {
-		update_post_meta( $question_post_id, 'question_pro_id', (int) $pro_question_id );
-
-		if ( function_exists( 'learndash_update_setting' ) ) {
-			learndash_update_setting( $question_post_id, 'quiz', (int) $quiz_post_id );
-			learndash_update_setting( $question_post_id, 'question_pro_id', (int) $pro_question_id );
-			$quiz_pro_id = $this->get_pro_quiz_id_for_post( (int) $quiz_post_id );
-			if ( $quiz_pro_id > 0 ) {
-				learndash_update_setting( $question_post_id, 'quiz_pro_id', (int) $quiz_pro_id );
-			}
-		}
-
-		update_post_meta( $question_post_id, 'quiz_id', (int) $quiz_post_id );
-
-		if ( function_exists( 'learndash_proquiz_sync_question_fields' ) ) {
-			learndash_proquiz_sync_question_fields( (int) $question_post_id, (int) $pro_question_id );
-		}
-
-		if ( $update_builder ) {
-			$this->update_quiz_builder_questions( (int) $quiz_post_id, (int) $question_post_id );
-		}
-	}
-
-	/**
-	 * Actualiza el builder de preguntas del quiz preservando la estructura real usada por LearnDash.
-	 *
-	 * @param int $quiz_post_id
-	 * @param int $question_post_id
-	 * @return void
-	 */
-	private function update_quiz_builder_questions( $quiz_post_id, $question_post_id ) {
-		if ( ! function_exists( 'learndash_get_quiz_questions' ) || ! function_exists( 'learndash_set_quiz_questions' ) ) {
-			return;
-		}
-
-		$questions_before = learndash_get_quiz_questions( (int) $quiz_post_id );
-		$this->debug_log( sprintf( 'Builder antes update. quiz_post_id=%d | data=%s', (int) $quiz_post_id, wp_json_encode( $questions_before ) ) );
-
-		$questions_after = $this->append_question_preserving_structure( $questions_before, (int) $question_post_id );
-		learndash_set_quiz_questions( (int) $quiz_post_id, $questions_after );
-
-		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
-			learndash_update_quiz_questions( (int) $quiz_post_id );
-		}
-
-		/**
-		 * Hook de compatibilidad para permitir a LearnDash/terceros rehacer estructuras si lo necesitan.
-		 */
-		do_action( 'learndash_quiz_questions_updated', (int) $quiz_post_id, $questions_after );
-
-		$questions_final = learndash_get_quiz_questions( (int) $quiz_post_id );
-		$this->debug_log( sprintf( 'Builder despues update. quiz_post_id=%d | added_question_post_id=%d | data=%s', (int) $quiz_post_id, (int) $question_post_id, wp_json_encode( $questions_final ) ) );
-	}
-
-	/**
-	 * Inserta una pregunta nueva preservando la forma exacta del array original.
-	 *
-	 * @param mixed $questions_data
-	 * @param int   $question_post_id
-	 * @return array<mixed>
-	 */
-	private function append_question_preserving_structure( $questions_data, $question_post_id ) {
-		if ( ! is_array( $questions_data ) || empty( $questions_data ) ) {
-			return array( (int) $question_post_id => 1 );
-		}
-
-		$questions = $questions_data;
-
-		if ( isset( $questions['questions'] ) && is_array( $questions['questions'] ) ) {
-			$questions['questions'] = $this->append_question_preserving_structure( $questions['questions'], (int) $question_post_id );
-			return $questions;
-		}
-
-		$first = reset( $questions );
-
-		// Estructura tipo [question_id => order].
-		if ( $this->is_assoc_array( $questions ) && $this->all_keys_numeric( $questions ) ) {
-			if ( ! isset( $questions[ (int) $question_post_id ] ) ) {
-				$next_order = empty( $questions ) ? 1 : ( max( array_map( 'intval', array_values( $questions ) ) ) + 1 );
-				$questions[ (int) $question_post_id ] = $next_order;
-			}
-			return $questions;
-		}
-
-		// Estructura lista de IDs: [12, 18, 34].
-		if ( ! $this->is_assoc_array( $questions ) && is_numeric( $first ) ) {
-			if ( ! in_array( (int) $question_post_id, array_map( 'intval', $questions ), true ) ) {
-				$questions[] = (int) $question_post_id;
-			}
-			return $questions;
-		}
-
-		// Estructura lista de arrays con identificador interno (id/question_id/post_id).
-		if ( ! $this->is_assoc_array( $questions ) && is_array( $first ) ) {
-			$exists = false;
-			foreach ( $questions as $entry ) {
-				if ( ! is_array( $entry ) ) {
-					continue;
-				}
-				$entry_id = isset( $entry['question_id'] ) ? (int) $entry['question_id'] : ( isset( $entry['post_id'] ) ? (int) $entry['post_id'] : ( isset( $entry['id'] ) ? (int) $entry['id'] : 0 ) );
-				if ( $entry_id === (int) $question_post_id ) {
-					$exists = true;
-					break;
-				}
-			}
-
-			if ( ! $exists ) {
-				$order = count( $questions ) + 1;
-				$questions[] = array(
-					'id'          => (int) $question_post_id,
-					'question_id' => (int) $question_post_id,
-					'post_id'     => (int) $question_post_id,
-					'sort'        => $order,
-					'order'       => $order,
-				);
-			}
-
-			return $questions;
-		}
-
-		// Fallback defensivo.
-		$questions[ (int) $question_post_id ] = count( $questions ) + 1;
-		return $questions;
-	}
-
-	/**
-	 * @param array<mixed> $array
-	 * @return bool
-	 */
-	private function is_assoc_array( $array ) {
-		if ( array() === $array ) {
-			return false;
-		}
-
-		return array_keys( $array ) !== range( 0, count( $array ) - 1 );
-	}
-
-	/**
-	 * @param array<mixed> $array
-	 * @return bool
-	 */
-	private function all_keys_numeric( $array ) {
-		foreach ( array_keys( $array ) as $key ) {
-			if ( ! is_numeric( $key ) ) {
-				return false;
-			}
-		}
-
-		return true;
-	}
-
-
-	/**
-	 * Reconstruye completamente el builder de un quiz existente: limpia inválidas,
-	 * mantiene válidas y agrega las nuevas preguntas importadas con reindexación total.
-	 *
-	 * @param int   $quiz_post_id
-	 * @param int[] $new_question_ids
-	 * @return void
-	 */
-	private function rebuild_existing_quiz_builder( $quiz_post_id, $new_question_ids ) {
-		if ( ! function_exists( 'learndash_get_quiz_questions' ) || ! function_exists( 'learndash_set_quiz_questions' ) ) {
-			return;
-		}
-
-		$builder_original = learndash_get_quiz_questions( (int) $quiz_post_id );
-		$this->debug_log( sprintf( 'Rebuild existing builder (original). quiz_post_id=%d | data=%s', (int) $quiz_post_id, wp_json_encode( $builder_original ) ) );
-
-		$existing_ids = $this->extract_question_post_ids_from_builder( $builder_original );
-		$valid_ids    = array();
-		foreach ( $existing_ids as $question_id ) {
-			if ( $this->is_valid_question_post( (int) $question_id ) ) {
-				$valid_ids[] = (int) $question_id;
-			}
-		}
-
-		$new_valid_ids = array();
-		foreach ( $new_question_ids as $question_id ) {
-			if ( $this->is_valid_question_post( (int) $question_id ) ) {
-				$new_valid_ids[] = (int) $question_id;
-			}
-		}
-
-		$final_ids = array_values( array_unique( array_merge( $valid_ids, $new_valid_ids ) ) );
-		$final_builder = array();
-		foreach ( $final_ids as $index => $question_id ) {
-			$final_builder[ (int) $question_id ] = $index + 1;
-		}
-
-		learndash_set_quiz_questions( (int) $quiz_post_id, $final_builder );
-
-		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
-			learndash_update_quiz_questions( (int) $quiz_post_id );
-		}
-
-		clean_post_cache( (int) $quiz_post_id );
-		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
-
-		do_action( 'learndash_quiz_questions_updated', (int) $quiz_post_id, $final_builder );
-
-		$builder_final = learndash_get_quiz_questions( (int) $quiz_post_id );
-		$this->debug_log( sprintf( 'Rebuild existing builder (final). quiz_post_id=%d | data=%s', (int) $quiz_post_id, wp_json_encode( $builder_final ) ) );
-	}
-
-	/**
-	 * Extrae IDs de preguntas del builder sin asumir una sola forma.
-	 *
-	 * @param mixed $builder_data
-	 * @return int[]
-	 */
-	private function extract_question_post_ids_from_builder( $builder_data ) {
-		$ids = array();
-
-		if ( ! is_array( $builder_data ) ) {
-			return $ids;
-		}
-
-		if ( isset( $builder_data['questions'] ) && is_array( $builder_data['questions'] ) ) {
-			return $this->extract_question_post_ids_from_builder( $builder_data['questions'] );
-		}
-
-		// Caso común LearnDash: [question_post_id => order].
-		if ( $this->is_assoc_array( $builder_data ) && $this->all_keys_numeric( $builder_data ) ) {
-			$ids = array_map( 'intval', array_keys( $builder_data ) );
-			return array_values( array_unique( array_filter( $ids ) ) );
-		}
-
-		// Lista simple de IDs [12, 18, 34].
-		$first = reset( $builder_data );
-		if ( ! $this->is_assoc_array( $builder_data ) && is_numeric( $first ) ) {
-			$ids = array_map( 'intval', $builder_data );
-			return array_values( array_unique( array_filter( $ids ) ) );
-		}
-
-		// Lista de arrays con ids embebidos.
-		foreach ( $builder_data as $value ) {
-			if ( ! is_array( $value ) ) {
-				continue;
-			}
-
-			if ( isset( $value['question_id'] ) && is_numeric( $value['question_id'] ) ) {
-				$ids[] = (int) $value['question_id'];
-			}
-			if ( isset( $value['post_id'] ) && is_numeric( $value['post_id'] ) ) {
-				$ids[] = (int) $value['post_id'];
-			}
-			if ( isset( $value['id'] ) && is_numeric( $value['id'] ) ) {
-				$ids[] = (int) $value['id'];
-			}
-		}
-
-		return array_values( array_unique( array_filter( array_map( 'intval', $ids ) ) ) );
-	}
-
-	/**
-	 * @param int $question_id
-	 * @return bool
-	 */
-	private function is_valid_question_post( $question_id ) {
-		if ( $question_id <= 0 ) {
-			return false;
-		}
-
-		$post = get_post( (int) $question_id );
-		if ( ! $post || 'sfwd-question' !== $post->post_type ) {
-			return false;
-		}
-
-		if ( in_array( $post->post_status, array( 'trash', 'auto-draft' ), true ) ) {
-			return false;
-		}
-
-		return true;
-	}
-
 	private function extract_model_id( $model, $save_result ) {
 		if ( is_object( $model ) && method_exists( $model, 'getId' ) ) {
 			$model_id = (int) $model->getId();
@@ -693,6 +705,19 @@ class LTI_LearnDash_Service {
 	}
 
 	/**
+	 * @param int   $quiz_post_id
+	 * @param int   $pro_quiz_id
+	 * @return void
+	 */
+	private function link_quiz_post_to_pro_quiz( $quiz_post_id, $pro_quiz_id ) {
+		update_post_meta( $quiz_post_id, 'quiz_pro_id', (int) $pro_quiz_id );
+
+		if ( function_exists( 'learndash_update_setting' ) ) {
+			learndash_update_setting( $quiz_post_id, 'quiz_pro', (int) $pro_quiz_id );
+		}
+	}
+
+	/**
 	 * @param int[] $question_post_ids
 	 * @return void
 	 */
@@ -700,6 +725,32 @@ class LTI_LearnDash_Service {
 		foreach ( $question_post_ids as $question_post_id ) {
 			wp_delete_post( (int) $question_post_id, true );
 		}
+	}
+
+	/**
+	 * @param array<mixed> $array
+	 * @return bool
+	 */
+	private function is_assoc_array( $array ) {
+		if ( array() === $array ) {
+			return false;
+		}
+
+		return array_keys( $array ) !== range( 0, count( $array ) - 1 );
+	}
+
+	/**
+	 * @param array<mixed> $array
+	 * @return bool
+	 */
+	private function all_keys_numeric( $array ) {
+		foreach ( array_keys( $array ) as $key ) {
+			if ( ! is_numeric( $key ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
