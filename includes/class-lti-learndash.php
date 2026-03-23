@@ -485,6 +485,9 @@ class LTI_LearnDash_Service {
 					if ( method_exists( $model, 'setSort' ) ) {
 						$model->setSort( (int) $position );
 					}
+					if ( method_exists( $model, 'setOnline' ) ) {
+						$model->setOnline( true );
+					}
 					$mapper->save( $model );
 					$after_id = method_exists( $model, 'getId' ) ? (int) $model->getId() : 0;
 					$after_qz = method_exists( $model, 'getQuizId' ) ? (int) $model->getQuizId() : 0;
@@ -760,6 +763,12 @@ class LTI_LearnDash_Service {
 			$question_model->setAnswerData( $answers );
 			$question_model->setAnswerType( 'single' );
 			$question_model->setCorrectSameText( true );
+			if ( method_exists( $question_model, 'setOnline' ) ) {
+				$question_model->setOnline( true );
+			}
+			if ( method_exists( $question_model, 'setSort' ) ) {
+				$question_model->setSort( 0 );
+			}
 
 			$feedback_message = sanitize_textarea_field( (string) $item['comment'] );
 			$question_model->setCorrectMsg( $feedback_message );
