@@ -270,6 +270,7 @@ class LTI_LearnDash_Service {
 		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
 			learndash_set_quiz_questions( (int) $quiz_post_id, $final_builder );
 		}
+		$this->persist_quiz_builder_questions( (int) $quiz_post_id, $final_builder, $final_ids );
 
 		foreach ( $final_ids as $question_id ) {
 			$this->sync_question_quiz_relations( (int) $question_id, (int) $quiz_post_id, (int) $quiz_pro_id );
@@ -293,7 +294,9 @@ class LTI_LearnDash_Service {
 		do_action( 'learndash_quiz_questions_updated', (int) $quiz_post_id, $final_builder );
 
 		$builder_after = function_exists( 'learndash_get_quiz_questions' ) ? learndash_get_quiz_questions( (int) $quiz_post_id ) : array();
-		$this->debug_log( sprintf( 'Resync end. quiz_post_id=%d | quiz_pro_id=%d | final_builder_saved=%s | final_builder_read=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final_builder ), wp_json_encode( $builder_after ) ) );
+		$builder_ids   = $this->get_builder_question_ids( (int) $quiz_post_id );
+		$builder_pros  = $this->get_builder_question_pro_ids( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Resync end. quiz_post_id=%d | quiz_pro_id=%d | final_builder_saved=%s | final_builder_read=%s | builder_ids=%s | builder_pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final_builder ), wp_json_encode( $builder_after ), wp_json_encode( $builder_ids ), wp_json_encode( $builder_pros ) ) );
 
 		return true;
 	}
@@ -427,26 +430,9 @@ class LTI_LearnDash_Service {
 		}
 
 		$mapper = new WpProQuiz_Model_QuestionMapper();
-		if ( ! method_exists( $mapper, 'fetchAll' ) ) {
-			return true;
+		if ( method_exists( $mapper, 'fetchAll' ) ) {
+			$this->log_mapper_fetchall_diagnostics( $mapper, (int) $quiz_pro_id, (array) $new_valid_pro_ids );
 		}
-		$this->log_mapper_fetchall_diagnostics( $mapper, (int) $quiz_pro_id, (array) $new_valid_pro_ids );
-
-		try {
-			$current_models = $mapper->fetchAll( (int) $quiz_pro_id );
-		} catch ( Exception $e ) {
-			return new WP_Error( 'lti_proquiz_fetchall_error', $e->getMessage() );
-		}
-
-		$current_pro_ids = array();
-		if ( is_array( $current_models ) ) {
-			foreach ( $current_models as $model ) {
-				if ( is_object( $model ) && method_exists( $model, 'getId' ) ) {
-					$current_pro_ids[] = (int) $model->getId();
-				}
-			}
-		}
-		$this->debug_log( sprintf( 'ProQuiz current internal questions. quiz_post_id=%d | quiz_pro_id=%d | pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $current_pro_ids ) ) );
 
 		$final_pro_ids = array();
 		foreach ( $final_question_post_ids as $question_post_id ) {
@@ -457,22 +443,6 @@ class LTI_LearnDash_Service {
 		}
 		$final_pro_ids = array_values( array_unique( $final_pro_ids ) );
 		$this->debug_log( sprintf( 'ProQuiz final valid internal questions. quiz_post_id=%d | quiz_pro_id=%d | pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $final_pro_ids ) ) );
-
-		$orphan_pro_ids = array_values( array_diff( $current_pro_ids, $final_pro_ids ) );
-
-		foreach ( $orphan_pro_ids as $orphan_id ) {
-			if ( method_exists( $mapper, 'delete' ) ) {
-				$mapper->delete( (int) $orphan_id );
-			} elseif ( method_exists( $mapper, 'fetch' ) && method_exists( $mapper, 'save' ) ) {
-				$model = $mapper->fetch( (int) $orphan_id );
-				if ( $model && is_object( $model ) && method_exists( $model, 'setQuizId' ) ) {
-					$model->setQuizId( 0 );
-					$mapper->save( $model );
-				}
-			}
-		}
-
-		$this->debug_log( sprintf( 'ProQuiz orphan internal questions removed/detached. quiz_post_id=%d | quiz_pro_id=%d | pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $orphan_pro_ids ) ) );
 
 		$position = 1;
 		foreach ( $final_pro_ids as $pro_id ) {
@@ -502,31 +472,7 @@ class LTI_LearnDash_Service {
 			$position++;
 		}
 
-		$after_ids = array();
-		try {
-			$after_models = $mapper->fetchAll( (int) $quiz_pro_id );
-			if ( is_array( $after_models ) ) {
-				foreach ( $after_models as $model ) {
-					if ( is_object( $model ) && method_exists( $model, 'getId' ) ) {
-						$after_ids[] = (int) $model->getId();
-					}
-				}
-			}
-		} catch ( Exception $e ) {
-			return new WP_Error( 'lti_proquiz_final_fetch_error', $e->getMessage() );
-		}
-
-		$after_ids = array_values( array_unique( $after_ids ) );
-		$this->debug_log( sprintf( 'ProQuiz after_ids real. quiz_post_id=%d | quiz_pro_id=%d | pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $after_ids ) ) );
-
-		$new_missing = array_values( array_diff( array_values( array_unique( $new_valid_pro_ids ) ), $after_ids ) );
-		if ( ! empty( $new_missing ) ) {
-			$this->debug_log( sprintf( 'ProQuiz missing new pro IDs. quiz_post_id=%d | quiz_pro_id=%d | missing=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $new_missing ) ) );
-			$this->log_proquiz_question_rows( $new_valid_pro_ids, 'before_return_missing_new_pro_ids', (int) $quiz_pro_id );
-			return new WP_Error( 'lti_proquiz_missing_new', sprintf( 'Las nuevas preguntas no quedaron en la capa final real de WpProQuiz. Faltan pro IDs: %s', wp_json_encode( $new_missing ) ) );
-		}
-
-		$this->debug_log( sprintf( 'ProQuiz final internal state. quiz_post_id=%d | quiz_pro_id=%d | pro_ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $after_ids ) ) );
+		$this->log_proquiz_question_rows( $new_valid_pro_ids, 'after_secondary_sql_sync', (int) $quiz_pro_id );
 		return true;
 	}
 
@@ -918,6 +864,113 @@ class LTI_LearnDash_Service {
 		return true;
 	}
 
+	/**
+	 * Persiste preguntas del quiz en el Quiz Builder (fuente real para fetchAll en instalaciones con builder activo).
+	 *
+	 * @param int   $quiz_post_id
+	 * @param array $builder_map
+	 * @param int[] $builder_ids
+	 * @return void
+	 */
+	private function persist_quiz_builder_questions( $quiz_post_id, $builder_map, $builder_ids ) {
+		$builder_map = is_array( $builder_map ) ? $builder_map : array();
+		$builder_ids = array_values( array_unique( array_map( 'intval', (array) $builder_ids ) ) );
+
+		$quiz_questions = $this->get_quiz_questions_store( (int) $quiz_post_id );
+		if ( is_object( $quiz_questions ) ) {
+			$called = array();
+			if ( method_exists( $quiz_questions, 'set_questions' ) ) {
+				$quiz_questions->set_questions( $builder_map );
+				$called[] = 'set_questions(map)';
+			}
+			if ( method_exists( $quiz_questions, 'set_questions_ids' ) ) {
+				$quiz_questions->set_questions_ids( $builder_ids );
+				$called[] = 'set_questions_ids(ids)';
+			}
+			if ( method_exists( $quiz_questions, 'set_questions' ) ) {
+				$quiz_questions->set_questions( $builder_ids );
+				$called[] = 'set_questions(ids)';
+			}
+			if ( method_exists( $quiz_questions, 'save' ) ) {
+				$quiz_questions->save();
+				$called[] = 'save()';
+			}
+			if ( method_exists( $quiz_questions, 'update' ) ) {
+				$quiz_questions->update();
+				$called[] = 'update()';
+			}
+
+			$this->debug_log( sprintf( 'Builder persist via LDLMS object. quiz_post_id=%d | called=%s', (int) $quiz_post_id, wp_json_encode( $called ) ) );
+		}
+
+		if ( function_exists( 'learndash_set_quiz_questions' ) ) {
+			learndash_set_quiz_questions( (int) $quiz_post_id, $builder_map );
+		}
+		if ( function_exists( 'learndash_update_quiz_questions' ) ) {
+			learndash_update_quiz_questions( (int) $quiz_post_id );
+		}
+
+		clean_post_cache( (int) $quiz_post_id );
+		wp_cache_delete( (int) $quiz_post_id, 'post_meta' );
+	}
+
+	/**
+	 * @param int $quiz_post_id
+	 * @return object|null
+	 */
+	private function get_quiz_questions_store( $quiz_post_id ) {
+		if ( ! class_exists( 'LDLMS_Factory_Post' ) || ! method_exists( 'LDLMS_Factory_Post', 'quiz_questions' ) ) {
+			return null;
+		}
+
+		try {
+			return LDLMS_Factory_Post::quiz_questions( (int) $quiz_post_id );
+		} catch ( Exception $e ) {
+			$this->debug_log( 'get_quiz_questions_store error: ' . $e->getMessage() );
+		}
+
+		return null;
+	}
+
+	/**
+	 * @param int $quiz_post_id
+	 * @return int[]
+	 */
+	private function get_builder_question_ids( $quiz_post_id ) {
+		$store = $this->get_quiz_questions_store( (int) $quiz_post_id );
+		if ( is_object( $store ) && method_exists( $store, 'get_questions' ) ) {
+			$ids = $store->get_questions( 'ids' );
+			return $this->extract_question_post_ids_from_builder( is_array( $ids ) ? $ids : array() );
+		}
+
+		if ( function_exists( 'learndash_get_quiz_questions' ) ) {
+			return $this->extract_question_post_ids_from_builder( learndash_get_quiz_questions( (int) $quiz_post_id ) );
+		}
+
+		return array();
+	}
+
+	/**
+	 * @param int $quiz_post_id
+	 * @return int[]
+	 */
+	private function get_builder_question_pro_ids( $quiz_post_id ) {
+		$pro_ids = array();
+		$store   = $this->get_quiz_questions_store( (int) $quiz_post_id );
+		if ( is_object( $store ) && method_exists( $store, 'get_questions' ) ) {
+			$objects = $store->get_questions( 'pro_objects' );
+			if ( is_array( $objects ) ) {
+				foreach ( $objects as $object ) {
+					if ( is_object( $object ) && method_exists( $object, 'getId' ) ) {
+						$pro_ids[] = (int) $object->getId();
+					}
+				}
+			}
+		}
+
+		return array_values( array_unique( array_filter( $pro_ids ) ) );
+	}
+
 
 
 	/**
@@ -1145,9 +1198,11 @@ class LTI_LearnDash_Service {
 		$this->debug_log( sprintf( 'Verify created pro_question_ids. quiz_post_id=%d | quiz_pro_id=%d | ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $created_pro_ids ) ) );
 
 		$builder_after = function_exists( 'learndash_get_quiz_questions' ) ? learndash_get_quiz_questions( (int) $quiz_post_id ) : array();
-		$builder_ids   = $this->extract_question_post_ids_from_builder( $builder_after );
-		$this->debug_log( sprintf( 'Verify builder_after real. quiz_post_id=%d | builder=%s', (int) $quiz_post_id, wp_json_encode( $builder_after ) ) );
-		$this->debug_log( sprintf( 'Verify builder IDs finales reales. quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $builder_ids ) ) );
+		$builder_ids   = $this->get_builder_question_ids( (int) $quiz_post_id );
+		$builder_pros  = $this->get_builder_question_pro_ids( (int) $quiz_post_id );
+		$this->debug_log( sprintf( 'Verify builder_after raw. quiz_post_id=%d | builder=%s', (int) $quiz_post_id, wp_json_encode( $builder_after ) ) );
+		$this->debug_log( sprintf( 'Verify builder IDs reales (LDLMS). quiz_post_id=%d | ids=%s', (int) $quiz_post_id, wp_json_encode( $builder_ids ) ) );
+		$this->debug_log( sprintf( 'Verify builder pro IDs reales (LDLMS). quiz_post_id=%d | pro_ids=%s', (int) $quiz_post_id, wp_json_encode( $builder_pros ) ) );
 
 		$missing_in_builder = array_values( array_diff( $created_post_ids, $builder_ids ) );
 		if ( ! empty( $missing_in_builder ) ) {
@@ -1155,14 +1210,14 @@ class LTI_LearnDash_Service {
 			return new WP_Error( 'lti_verify_missing_builder', sprintf( 'Fallo de verificación: faltan preguntas nuevas en builder final: %s', wp_json_encode( $missing_in_builder ) ) );
 		}
 
-		$current_pro_ids = $this->get_current_proquiz_question_ids( (int) $quiz_pro_id );
-		$this->debug_log( sprintf( 'Verify after_ids reales de WpProQuiz. quiz_post_id=%d | quiz_pro_id=%d | ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $current_pro_ids ) ) );
-
-		$missing_in_proquiz = array_values( array_diff( $created_pro_ids, $current_pro_ids ) );
-		if ( ! empty( $missing_in_proquiz ) ) {
-			$this->debug_log( sprintf( 'Verify missing pro IDs in WpProQuiz. quiz_post_id=%d | quiz_pro_id=%d | missing=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $missing_in_proquiz ) ) );
-			return new WP_Error( 'lti_verify_missing_proquiz', sprintf( 'Fallo de verificación: faltan pro_question_ids nuevos en WpProQuiz final: %s', wp_json_encode( $missing_in_proquiz ) ) );
+		$missing_in_builder_pro = array_values( array_diff( $created_pro_ids, $builder_pros ) );
+		if ( ! empty( $missing_in_builder_pro ) ) {
+			$this->debug_log( sprintf( 'Verify missing pro IDs in builder pro_objects. quiz_post_id=%d | quiz_pro_id=%d | missing=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $missing_in_builder_pro ) ) );
+			return new WP_Error( 'lti_verify_missing_builder_pro', sprintf( 'Fallo de verificación: faltan pro_question_ids nuevos en builder (pro_objects): %s', wp_json_encode( $missing_in_builder_pro ) ) );
 		}
+
+		$current_pro_ids = $this->get_current_proquiz_question_ids( (int) $quiz_pro_id );
+		$this->debug_log( sprintf( 'Verify secondary SQL state de WpProQuiz. quiz_post_id=%d | quiz_pro_id=%d | ids=%s', (int) $quiz_post_id, (int) $quiz_pro_id, wp_json_encode( $current_pro_ids ) ) );
 
 		return true;
 	}
